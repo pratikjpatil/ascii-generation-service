@@ -4,5 +4,6 @@ import lombok.Data;
 
 @Data
 public class ReportRequest {
-    private Long id; // The user sends this in JSON
+    private String id;
+    private String reportDate; // The user sends this in JSON
 }

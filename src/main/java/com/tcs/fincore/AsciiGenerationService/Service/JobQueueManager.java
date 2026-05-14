@@ -26,7 +26,7 @@ public class JobQueueManager {
         this.asciiService = asciiService;
     }
 
-    // The Queue: Holds 'FileJob' (config ID + Specific File Path)
+    // The Queue: Holds 'FileJob' (Config ID + Specific File Path)
     private final BlockingQueue<FileJob> jobQueue = new LinkedBlockingQueue<>();
 
     // 10 Threads processing files in parallel

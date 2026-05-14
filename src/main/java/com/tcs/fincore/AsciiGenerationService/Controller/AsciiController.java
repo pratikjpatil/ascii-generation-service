@@ -14,13 +14,20 @@ public class AsciiController {
     private AsciiGenerationService service;
 
     @PostMapping("/generate")
+
     public ResponseEntity<String> generate(@RequestBody ReportRequest request) {
         try {
-            if (request.getId() == null) {
-                return ResponseEntity.badRequest().body("Error: 'id' is missing");
+            if (request.getId() == null 
+                || request.getId().isBlank())
+            {
+                return ResponseEntity.badRequest().body("Error: 'Id' is missing");
             }
 
-            String status = service.initiateBatch(request.getId());
+             if (request.getReportDate() == null || request.getReportDate().isBlank()) {
+                return ResponseEntity.badRequest().body("Error: 'Date' is missing");
+            }
+            Long id=Long.valueOf(request.getId());
+            String status = service.initiateBatch(id,request.getReportDate());
 
             return ResponseEntity.accepted().body("Success: " + status);
 

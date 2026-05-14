@@ -3,10 +3,27 @@ package com.tcs.fincore.AsciiGenerationService.Service;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.core.SqlOutParameter;
+import org.springframework.jdbc.core.SqlParameter;
+import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
+import org.springframework.jdbc.core.simple.SimpleJdbcCall;
 import org.springframework.scheduling.annotation.Async;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 import org.springframework.stereotype.Service;
 
+import jakarta.annotation.PreDestroy;
+
+import java.util.*;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.io.BufferedWriter;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -26,6 +43,24 @@ public class TbAsciiService {
 
     @Autowired
     private JdbcTemplate jdbcTemplate;
+    
+    @Autowired
+    AsyncTBService asyncTbService;
+    
+    @Autowired
+    @Qualifier("tbTaskExecutor")
+    ThreadPoolTaskExecutor executor;
+    
+    private final ExecutorService submissionSerice= 
+//    		Executors.newSingleThreadExecutor();
+    new ThreadPoolExecutor(
+    	    1,
+    	    1,
+    	    0L,
+    	    TimeUnit.SECONDS,
+    	    new ArrayBlockingQueue<>(3),
+    	    new ThreadPoolExecutor.AbortPolicy() // Throws RejectedExecutionException
+    	);
 
     /**
      * ASYNC TASK: Generates ONE file.
@@ -40,7 +75,7 @@ public class TbAsciiService {
         try {
             date = LocalDate.parse(dateStr);
         } catch (Exception e) {
-            log.error("[TB] Invalid Date: {}", dateStr);
+            log.error("[2TB] Invalid Date: {}", dateStr);
             return;
         }
 
@@ -90,5 +125,79 @@ public class TbAsciiService {
             }
             return null;
         });
+    }
+    
+    public void generateTemplate(String reportId, String branchCode, String dateStr, String outputDir) {
+    	
+    }
+    
+//    private void processTasks(String runId, String headerId, String footerId, List<String> branchCode,String dateStr,String outPutDir ) {
+//    	
+//    }
+
+    /*
+      Submitter method to submit task in Report generator service
+     */
+    public boolean generateFiles(List<String> reportIds, List<String> branchCodes, String dateStr, String outputDir) {
+    	//Non-Blocking background thread for submit ascii generation call
+    	try {
+            log.info("Submitting batch for report generation!");
+    	    submissionSerice.submit(()->{
+            long startTime = System.nanoTime();
+            List<CompletableFuture<Void>> futures = new ArrayList<>();
+            String run_id= UUID.randomUUID().toString();
+    		for(String reportId:reportIds)
+            {
+    		    SimpleJdbcCall jdbcCall = new SimpleJdbcCall(jdbcTemplate)
+    			    .withProcedureName("SP_PARSE_TB_TEMPLATE_N1").declareParameters(
+                            new SqlParameter("p_report_id", Types.VARCHAR),
+                            new SqlParameter("p_run_id", Types.VARCHAR), // IN
+                            new SqlOutParameter("p_header_id", Types.VARCHAR),
+                            new SqlOutParameter("p_footer_id", Types.VARCHAR)
+                    );
+    		MapSqlParameterSource in = new MapSqlParameterSource().addValue("p_report_id", reportId).addValue("p_run_id", run_id);
+            Map<String, Object> out= new HashMap<>();
+            try {
+                out = jdbcCall.execute(in);
+            } catch (Exception e) {
+                System.out.println(e.getMessage());
+            }
+            log.info("parsed template for the report: {}",reportId);
+    		String p_header_id = (String) out.get("p_header_id");
+    		String p_footer_id = (String) out.get("p_footer_id");
+            log.info("Generating {} reports",reportId);
+    		branchCodes.forEach((branchCode)->{
+    			futures.add(
+    					asyncTbService.performTask(reportId,run_id,branchCode,dateStr, p_header_id,p_footer_id,outputDir)
+    					);
+    		});
+    		}
+            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+            long endTime = System.nanoTime();
+            long durationInMillis = (endTime - startTime) / 1_000_000;
+            log.info("completed the batch with run_id : {}  in {} ms",run_id,durationInMillis);
+            jdbcTemplate.update("delete from TB_BREAKUP_META_STAGE where run_id = ?", run_id);
+    	});
+    	}catch(RejectedExecutionException e) {
+    		return false;
+    	}
+    	return true;
+    }
+
+    @PreDestroy
+    public void closeConnection() {
+      submissionSerice.shutdown(); 
+      try{
+          if (!submissionSerice.awaitTermination(10, TimeUnit.SECONDS)) {
+              submissionSerice.shutdownNow();
+              // Optional: wait again to ensure interruption is processed
+              if (!submissionSerice.awaitTermination(5, TimeUnit.SECONDS)) {
+                  System.err.println("Executor did not terminate");
+              }
+          }
+	} catch (InterruptedException e) {
+		submissionSerice.shutdownNow();
+        Thread.currentThread().interrupt();
+	}
     }
 }
