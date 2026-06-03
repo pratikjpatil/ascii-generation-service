@@ -15,21 +15,21 @@ import java.util.concurrent.ThreadPoolExecutor;
 @Component
 @Slf4j
 public class ThreadPoolMonitorAspect {
-
-    @Autowired
-    @Qualifier("tbTaskExecutor")
-    private ThreadPoolTaskExecutor taskExecutor; // Ensure you qualify this if you have multiple executors
+//
+//    @Autowired
+//    @Qualifier("tbTaskExecutor")
+//    private ThreadPoolTaskExecutor taskExecutor; // Ensure you qualify this if you have multiple executors
 
     // Intercept methods annotated with @Async or specific service methods
-    @Before("execution(* com.example.service.*.*(..))")
-    public void logActiveThreads() {
-        int activeCount = taskExecutor.getActiveCount();
-        System.out.println("Active Threads on Method Call: " + activeCount);
-    }
-
-    @Scheduled (fixedRate = 30000)
-    public void reportThreadPoolStatus() {
-        ThreadPoolExecutor executor = taskExecutor.getThreadPoolExecutor();
-       log.info("Active Threads (30s interval): {} | Queue Size : {} ",executor.getActiveCount(),executor.getQueue().size());
-    }
+//    @Before("execution(* com.example.service.*.*(..))")
+//    public void logActiveThreads() {
+//        int activeCount = taskExecutor.getActiveCount();
+//        System.out.println("Active Threads on Method Call: " + activeCount);
+//    }
+//
+//    @Scheduled (fixedRate = 10000)
+//    public void reportThreadPoolStatus() {
+//        ThreadPoolExecutor executor = taskExecutor.getThreadPoolExecutor();
+//       log.info("Active Threads (30s interval): {} | Queue Size : {} | completed tasks: {}",executor.getActiveCount(),executor.getQueue().size(),  executor.getTaskCount());
+//    }
 }

@@ -1,17 +1,15 @@
 package com.tcs.fincore.AsciiGenerationService.kafka;
 
-import com.tcs.fincore.AsciiGenerationService.DTO.ReportGenerationDTO;
-import com.tcs.fincore.AsciiGenerationService.DTO.ReportGenerationResponseDTO;
-import com.tcs.fincore.AsciiGenerationService.Service.KafkaService;
+import com.tcs.fincore.AsciiGenerationService.dto.ReportGenerationDTO;
+import com.tcs.fincore.AsciiGenerationService.dto.ReportGenerationResponseDTO;
+import com.tcs.fincore.AsciiGenerationService.service.KafkaService;
 import com.tcs.fincore.AsciiGenerationService.util.Constants;
 
 //import io.github.resilience4j.circuitbreaker.CallNotPermittedException;
-import jakarta.validation.ConstraintViolationException;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 
-import java.time.LocalDateTime;
 import java.util.Set;
 import java.util.stream.Collectors;
 
@@ -21,7 +19,6 @@ import jakarta.validation.Validator;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.messaging.handler.annotation.Payload;
 import org.springframework.stereotype.Service;
-import org.springframework.validation.annotation.Validated;
 
 // @Slf4j
 // @Service
@@ -72,7 +69,7 @@ public class ReportKafkaConsumer {
 
     @KafkaListener(topics = "ascii-report-generation-request", groupId = "Airflow_ETL",
     properties = {
-            "spring.json.value.default.type=com.tcs.fincore.AsciiGenerationService.DTO.ReportGenerationDTO"}
+            "spring.json.value.default.type=com.tcs.fincore.AsciiGenerationService.dto.ReportGenerationDTO"}
     )
     public void consume(@Valid @Payload ReportGenerationDTO request) {
         log.info("Received ASCII Report Generation Request: {}", request);
