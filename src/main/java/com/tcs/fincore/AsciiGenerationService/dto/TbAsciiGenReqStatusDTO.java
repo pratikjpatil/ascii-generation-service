@@ -27,14 +27,14 @@ public class TbAsciiGenReqStatusDTO {
     }
 
     public synchronized void setStatus(ReportStatus status) {
+        if (ReportStatus.QUEUED.equals(status) && this.status != null && !this.status.isBlank()) {
+            return;
+        }
+        this.status = status.name();
+    }
 
-            if (status.equals(ReportStatus.QUEUED)) {
-                if (this.status == null || this.status.equals("")) {
-                    this.status = status.name();
-                }
-                return;
-            }
-            this.status=this.status = status.name();
+    public String compositeRunId() {
+        return processRunId + "_" + stageId + "_" + runId;
     }
 
     public void setEndTime(String endTime) {
@@ -52,5 +52,4 @@ public class TbAsciiGenReqStatusDTO {
     public void setMessage(String message) {
         this.message = message;
     }
-
 }

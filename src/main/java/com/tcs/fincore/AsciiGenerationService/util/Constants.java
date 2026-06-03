@@ -1,8 +1,11 @@
 package com.tcs.fincore.AsciiGenerationService.util;
 
-public class Constants {
-    public static  String SUCCESS="SUCCESS";
-    public static  String PARTIAL_SUCCESS="PARTIAL_SUCCESS";
-    public static  String FAILED="FAILED";
+public final class Constants {
+    private Constants() {
+    }
 
+    public static final String GENERATING = "GENERATING";
+    public static final String SUCCESS = "SUCCESS";
+    public static final String PARTIAL_SUCCESS = "PARTIAL_SUCCESS";
+    public static final String FAILED = "FAILED";
 }
