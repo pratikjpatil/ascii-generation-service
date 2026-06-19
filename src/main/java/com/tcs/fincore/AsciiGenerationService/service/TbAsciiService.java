@@ -12,6 +12,7 @@ import org.apache.commons.collections4.map.SingletonMap;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.dao.DataAccessException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.SqlOutParameter;
@@ -37,27 +38,18 @@ import java.time.Instant;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Objects;
-import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.RejectedExecutionException;
-import java.util.concurrent.Semaphore;
-import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
+import java.util.*;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
 @Service
 public class TbAsciiService {
+
+    @Value("${procedure.ascii.parsetemplate}")
+    private String parseTemplateProcedure;
+
     private static final String TOPIC = "tb_ascii-report-generation-request-status";
     private static final Logger log = LoggerFactory.getLogger(TbAsciiService.class);
     private static final Semaphore DB_SEMAPHORE = new Semaphore(15, true);
@@ -75,6 +67,7 @@ public class TbAsciiService {
     private final TbAsciiGenerationService tbAsciiGenerationService;
     private final KafkaTemplate<String, Object> kafkaTemplate;
     private final ConcurrentHashMap<String, TbAsciiGenReqStatusDTO> statusTracker = new ConcurrentHashMap<>();
+//    private final LinkedHashMap<String, ConcurrentHashMap<String,Object>> lastFewStatus= new LinkedHashMap<>();
 
     @Autowired
     public TbAsciiService(JdbcTemplate jdbcTemplate,
@@ -85,60 +78,7 @@ public class TbAsciiService {
         this.kafkaTemplate = kafkaTemplate;
     }
 
-    @Async("tbTaskExecutor")
-    public void generateSingleFileAsync(String reportId, String branchCode, String dateStr, String outputDir) {
-        LocalDate date;
-        try {
-            date = LocalDate.parse(dateStr);
-        } catch (DateTimeParseException ex) {
-            log.error("Invalid TB ASCII date. date={}", dateStr, ex);
-            return;
-        }
 
-        String safeDate = date.format(DateTimeFormatter.BASIC_ISO_DATE);
-        String fileName = String.format("%s_%s_%s.txt", reportId, branchCode, safeDate);
-        Path targetPath;
-        try {
-            Path baseDir = Paths.get(outputDir).normalize();
-            if (!Files.exists(baseDir)) {
-                Files.createDirectories(baseDir);
-            }
-            targetPath = baseDir.resolve(fileName).normalize();
-            if (!targetPath.startsWith(baseDir)) {
-                throw new PathValidationException("Path traversal detected");
-            }
-        } catch (IOException | PathValidationException ex) {
-            log.error("TB ASCII path error. branchCode={}, outputDir={}", branchCode, outputDir, ex);
-            return;
-        }
-
-        try {
-            jdbcTemplate.execute((Connection conn) -> {
-                try (CallableStatement cstmt = conn.prepareCall("{call SP_GENERATE_TB_ASCII_STREAM(?, ?, ?, ?)}")) {
-                    cstmt.setString(1, reportId);
-                    cstmt.setString(2, branchCode);
-                    cstmt.setDate(3, java.sql.Date.valueOf(date));
-                    cstmt.registerOutParameter(4, Types.REF_CURSOR);
-                    cstmt.execute();
-                    try (ResultSet rs = (ResultSet) cstmt.getObject(4);
-                         BufferedWriter writer = Files.newBufferedWriter(targetPath, StandardCharsets.UTF_8)) {
-                        while (rs.next()) {
-                            String line = rs.getString(1);
-                            if (line != null) {
-                                writer.write(line);
-                                writer.newLine();
-                            }
-                        }
-                    } catch (IOException ex) {
-                        throw new SQLException("Unable to write TB ASCII single-file output", ex);
-                    }
-                }
-                return null;
-            });
-        } catch (DataAccessException ex) {
-            log.error("TB ASCII single-file DB error. fileName={}", fileName, ex);
-        }
-    }
 
     private void processTBAsciiGeneration(TbAsciiGenReqStatusDTO reqStatusDTO,
                                           TbAsciiBatchRequestPayload payload,
@@ -165,8 +105,9 @@ public class TbAsciiService {
                 continue;
             }
             log.info("Generating TB ASCII report. reportId={}, branches={}, batchSize={}", reportId, payload.getBranchCodes().size(), BATCH_SIZE);
+            log.info("TB ASCII Procedure name parseTemplate: {} ",parseTemplateProcedure);
             ConcurrentHashMap<String, Integer> perReportStatus = new ConcurrentHashMap<>();
-            perReportStatus.put("report_processed", 0);
+            perReportStatus.put("reports_processed", 0);
             batchStatus.put(reportId, perReportStatus);
             AtomicBoolean checkedPathTraversal = new AtomicBoolean(false);
 
@@ -179,14 +120,15 @@ public class TbAsciiService {
                         reportId,
                         runId,
                         codes,
-                        payload.getBalanceDate(),
+//                        payload.getBalanceDate(),
                         templateIds.headerId(),
                         templateIds.footerId(),
+                        templateIds.fileIdentifier(),
                         date,
                         checkedPathTraversal
                 ).handle((result, throwable) -> {
                     DB_SEMAPHORE.release();
-                    perReportStatus.merge("report_processed", codes.size(), Integer::sum);
+                    perReportStatus.merge("reports_processed", codes.size(), Integer::sum);
                     if (throwable != null) {
                         if (throwable.getMessage() != null && throwable.getMessage().contains("Connection Failed")) {
                             connectionFailure.incrementAndGet();
@@ -265,12 +207,13 @@ public class TbAsciiService {
 
     private TemplateIds parseTemplate(String reportId, String runId) {
         SimpleJdbcCall jdbcCall = new SimpleJdbcCall(jdbcTemplate)
-                .withProcedureName("SP_PARSE_TB_TEMPLATE_N1")
+                .withProcedureName(parseTemplateProcedure)
                 .declareParameters(
                         new SqlParameter("p_report_id", Types.VARCHAR),
                         new SqlParameter("p_run_id", Types.VARCHAR),
                         new SqlOutParameter("p_header_id", Types.VARCHAR),
-                        new SqlOutParameter("p_footer_id", Types.VARCHAR)
+                        new SqlOutParameter("p_footer_id", Types.VARCHAR),
+                        new SqlOutParameter("p_file_identifier",Types.VARCHAR)
                 );
         MapSqlParameterSource in = new MapSqlParameterSource()
                 .addValue("p_report_id", reportId)
@@ -278,7 +221,11 @@ public class TbAsciiService {
         try {
             Map<String, Object> out = jdbcCall.execute(in);
             log.info("Parsed TB ASCII template. reportId={}, runId={}", reportId, runId);
-            return new TemplateIds((String) out.get("p_header_id"), (String) out.get("p_footer_id"));
+            return new TemplateIds(
+                    (String) out.get("p_header_id"),
+                    (String) out.get("p_footer_id"),
+                    (String) out.get("p_file_identifier")
+            );
         } catch (DataAccessException ex) {
             log.error("Failed parsing TB ASCII template. reportId={}, runId={}", reportId, runId, ex);
             throw new TbAsciiGenerationException("Unable to parse TB template for report: " + reportId, ex);
@@ -324,7 +271,7 @@ public class TbAsciiService {
                                          Map<String, Map<String, Object>> result) {
         payload.getReportIds().forEach(reportId -> {
             ConcurrentHashMap<String, Integer> perReportStat = batchStatus.get(reportId);
-            int processed = perReportStat == null ? 0 : perReportStat.getOrDefault("report_processed", 0);
+            int processed = perReportStat == null ? 0 : perReportStat.getOrDefault("reports_processed", 0);
             int abortedCount = payload.getBranchCodes().size() - processed;
             if (!result.containsKey(reportId)) {
                 Map<String, Object> reportState = new HashMap<>();
@@ -385,6 +332,13 @@ public class TbAsciiService {
 
     private void saveAndSendEvent(TbAsciiGenReqStatusDTO status) {
         statusTracker.put(status.compositeRunId(), status);
+//        SequencedSet<String> statusKeySet=lastFewStatus.sequencedKeySet();
+//        if(!statusKeySet.contains(status.compositeRunId())) {
+//            if (lastFewStatus.size() >= 5) {
+//                lastFewStatus.remove(statusKeySet.getFirst());
+//            }
+//        }
+//        lastFewStatus.put(status.compositeRunId(), status);
         if ("KAFKA-Scheduled".equalsIgnoreCase(status.getCreationMethod())) {
             kafkaTemplate.send(TOPIC, status).whenComplete((res, err) -> {
                 if (err != null) {
@@ -396,6 +350,6 @@ public class TbAsciiService {
         }
     }
 
-    private record TemplateIds(String headerId, String footerId) {
+    private record TemplateIds(String headerId, String footerId,String fileIdentifier) {
     }
 }

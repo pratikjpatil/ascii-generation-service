@@ -39,6 +39,9 @@ public class TbAsciiGenerationService {
     private static final String BRANCH_CODE_PATTERN = "[A-Za-z0-9_-]{1,20}";
     private static final String REPORT_SEGMENT_PATTERN = "[A-Za-z0-9_-]{1,80}";
 
+    @Value("${procedure.ascii.generate}")
+    private String generateAsciiProcedureName;
+
     @Autowired
     JdbcTemplate jdbcTemplate;
 
@@ -52,9 +55,10 @@ public class TbAsciiGenerationService {
     public CompletableFuture<String> processBatch(String reportId,
                                                   String runId,
                                                   List<String> branchCodes,
-                                                  String dateStr,
+//                                                  String dateStr,
                                                   String headerId,
                                                   String footerId,
+                                                  String fileIdentifier,
                                                   LocalDate date,
                                                   AtomicBoolean checkedPathTraversal) {
         validateReportId(reportId);
@@ -64,7 +68,7 @@ public class TbAsciiGenerationService {
             throw new TbAsciiGenerationException("HDFS Connection Failed");
         }
 
-        String safeDate = date.format(DateTimeFormatter.BASIC_ISO_DATE);
+        String safeDate = date.toString();
         org.apache.hadoop.fs.Path reportDir = resolveReportDirectory(reportId, safeDate);
         ensureReportDirectory(hdfs, reportDir, checkedPathTraversal, branchCodes);
 
@@ -72,7 +76,7 @@ public class TbAsciiGenerationService {
         int retries = 0;
         while (retries < MAX_RETRY) {
             try {
-                generateBatchFiles(hdfs, reportDir, reportId, runId, branchCodes, date, headerId, footerId, safeDate, errorSb);
+                generateBatchFiles(hdfs, reportDir, fileIdentifier, runId, branchCodes, date, headerId, footerId, safeDate, errorSb);
                 break;
             } catch (DataAccessException ex) {
                 retries++;
@@ -90,7 +94,7 @@ public class TbAsciiGenerationService {
 
     private void generateBatchFiles(FileSystem hdfs,
                                     org.apache.hadoop.fs.Path reportDir,
-                                    String reportId,
+                                    String fileIdentifier,
                                     String runId,
                                     List<String> branchCodes,
                                     LocalDate date,
@@ -107,7 +111,7 @@ public class TbAsciiGenerationService {
             boolean fileHadWriteError = false;
             try {
                 branchArray = oracleConnection.createOracleArray("TYPE_LIST", branchCodes.toArray(new String[0]));
-                try (CallableStatement cstmt = conn.prepareCall("{call SP_GENERATE_TB_ASCII_STREAM_NEW1(?, ?, ?, ?,?,?)}")) {
+                try (CallableStatement cstmt = conn.prepareCall("{call "+generateAsciiProcedureName+"(?, ?, ?, ?,?,?)}")) {
                     cstmt.setString(1, runId);
                     cstmt.setArray(2, branchArray);
                     cstmt.setDate(3, Date.valueOf(date));
@@ -130,7 +134,7 @@ public class TbAsciiGenerationService {
                                     appendBranchError(errorSb, 1, "UNKNOWN", "Database returned more branch files than requested");
                                     break;
                                 }
-                                fileName = buildFileName(reportId, branchCodes.get(counter), safeDate);
+                                fileName = buildFileName( branchCodes.get(counter),fileIdentifier,DateTimeFormatter.BASIC_ISO_DATE.format(date));
                                 fileWriter = getFileWriter(reportDir, fileName, hdfs);
                                 counter++;
                             } else if (fileWriter != null && !fileHadWriteError) {
@@ -163,14 +167,14 @@ public class TbAsciiGenerationService {
                 if (branchArray != null) {
                     branchArray.free();
                 }
-                log.info("TB ASCII batch cursor consumed. reportId={}, requestedBranches={}, processedBranches={}", reportId, branchCodes.size(), counter);
+//                log.info("TB ASCII batch cursor consumed. reportId={}, requestedBranches={}, processedBranches={}", fileIdentifier, branchCodes.size(), counter);
             }
             return null;
         });
     }
 
     private org.apache.hadoop.fs.Path resolveReportDirectory(String reportId, String safeDate) {
-        String reportSegment = reportId.split("_")[0].toLowerCase();
+        String reportSegment = reportId.toLowerCase();
         if (!reportSegment.matches(REPORT_SEGMENT_PATTERN)) {
             throw new PathValidationException("Invalid report id segment for output path: " + reportSegment);
         }
@@ -213,8 +217,8 @@ public class TbAsciiGenerationService {
         }
     }
 
-    private String buildFileName(String reportId, String branchCode, String safeDate) {
-        return String.format("%s_%s_%s.txt", reportId, branchCode, safeDate);
+    private String buildFileName(String branchCode,String identifier, String safeDate) {
+        return String.format("%s.%s.%s",branchCode,identifier, safeDate);
     }
 
     private BufferedWriter getFileWriter(org.apache.hadoop.fs.Path reportDir, String fileName, FileSystem hdfs) throws IOException {

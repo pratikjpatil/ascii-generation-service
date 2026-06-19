@@ -9,6 +9,7 @@ import com.tcs.fincore.AsciiGenerationService.kafka.ReportKafkaProducer;
 import com.tcs.fincore.AsciiGenerationService.model.AsciiConfig;
 import com.tcs.fincore.AsciiGenerationService.repository.AsciiConfigRepository;
 import com.tcs.fincore.AsciiGenerationService.util.Constants;
+import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.LocatedFileStatus;
@@ -34,30 +35,34 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 @Service
 @Slf4j
+@RequiredArgsConstructor
 public class AsciiGenerationService {
 
-    @Autowired
-    private AsciiConfigRepository configRepo;
-
-    @Autowired
-    private JobQueueManager jobQueueManager;
-
-    @Autowired
-    private HdfsService hdfsService;
-
-    @Autowired
-    private ReportKafkaProducer producer;
+//    private final AsciiGenerationService asciiService;
+    private final AsciiConfigRepository configRepo;
+    private final JobQueueManager jobQueueManager;
+    private final HdfsService hdfsService;
+    private final ReportKafkaProducer producer;
 
     private static final Map<String, Pattern> INPUT_REGEX_CACHE = new ConcurrentHashMap<>();
     private static final Map<String, BatchStats> BATCH_TRACKER = new ConcurrentHashMap<>();
     private static final Map<String, Map<String, Object>> ASCII_STATUS_TRACKER = new ConcurrentHashMap<>();
+
+    private final ThreadPoolExecutor submissionService = new ThreadPoolExecutor(
+            1,
+            1,
+            0L,
+            TimeUnit.SECONDS,
+            new ArrayBlockingQueue<>(3),
+            new ThreadPoolExecutor.AbortPolicy()
+    );
 
     private static class BatchStats {
         private final long startTime;
@@ -82,43 +87,57 @@ public class AsciiGenerationService {
     }
 
     public String initiateBatch(Long configId, String date, ReportGenerationResponseDTO eventTemplate) {
-        try {
-            AsciiConfig config = loadConfig(configId);
-            FileSystem fs = hdfsService.getFs();
-            String reportId = config.getReportId();
-            Path baseDir = new Path(basePath + "/" + date + "/" + reportId);
+        String batchId = UUID.randomUUID().toString();
+        CompletableFuture<Object> future = new CompletableFuture<>();
+        submissionService.submit(() -> {
+            try {
+                AsciiConfig config = loadConfig(configId);
+                FileSystem fs = hdfsService.getFs();
+                String reportId = config.getReportId();
+                Path baseDir = new Path(basePath + "/" + date + "/" + reportId);
 
-            log.info("Scanning ASCII input directory. configId={}, reportId={}, date={}, path={}", configId, reportId, date, baseDir);
-            RemoteIterator<LocatedFileStatus> files = fs.listFiles(baseDir, true);
-            List<Path> foundFiles = new ArrayList<>(35_000);
+                log.info("Scanning ASCII input directory. configId={}, reportId={}, date={}, path={}", configId, reportId, date, baseDir);
+                RemoteIterator<LocatedFileStatus> files = fs.listFiles(baseDir, true);
+                List<Path> foundFiles = new ArrayList<>(35_000);
 
-            while (files.hasNext()) {
-                LocatedFileStatus status = files.next();
-                if (status.isFile() && status.getPath().getName().endsWith(".psv")) {
-                    foundFiles.add(status.getPath());
+                while (files.hasNext()) {
+                    LocatedFileStatus status = files.next();
+                    if (status.isFile() && status.getPath().getName().endsWith(".psv")) {
+                        foundFiles.add(status.getPath());
+                    }
                 }
+
+                if (foundFiles.isEmpty()) {
+                    log.warn("No PSV input files found. configId={}, reportId={}, date={}, path={}", configId, reportId, date, baseDir);
+                    return future.complete(null);
+                }
+
+//            String batchId = UUID.randomUUID().toString();
+                BATCH_TRACKER.put(batchId, new BatchStats(foundFiles.size(), eventTemplate));
+                updateBatchStatus(batchId, Constants.GENERATING, foundFiles.size(), 0, foundFiles.size(), "Batch started");
+                sendBatchEvent(batchId, Constants.GENERATING, "Batch started with " + foundFiles.size() + " files", eventTemplate);
+
+                for (Path p : foundFiles) {
+                    jobQueueManager.submitFileJob(new FileJob(configId, p, batchId, date));
+//                asciiService.processSingleFile(new FileJob(configId, p, batchId, date));
+                }
+
+                log.info("ASCII batch started. batchId={}, configId={}, reportId={}, filesQueued={}", batchId, configId, reportId, foundFiles.size());
+                return future.complete(null);
+            } catch (IOException ex) {
+                log.error("ASCII batch initiation failed due to HDFS I/O. configId={}, date={}", configId, date, ex);
+                return future.complete(ex);
             }
-
-            if (foundFiles.isEmpty()) {
-                log.warn("No PSV input files found. configId={}, reportId={}, date={}, path={}", configId, reportId, date, baseDir);
-                return "No files found";
-            }
-
-            String batchId = UUID.randomUUID().toString();
-            BATCH_TRACKER.put(batchId, new BatchStats(foundFiles.size(), eventTemplate));
-            updateBatchStatus(batchId, Constants.GENERATING, foundFiles.size(), 0, foundFiles.size(), "Batch started");
-            sendBatchEvent(batchId, Constants.GENERATING, "Batch started with " + foundFiles.size() + " files", eventTemplate);
-
-            for (Path p : foundFiles) {
-                jobQueueManager.submitFileJob(new FileJob(configId, p, batchId, date));
-            }
-
-            log.info("ASCII batch started. batchId={}, configId={}, reportId={}, filesQueued={}", batchId, configId, reportId, foundFiles.size());
-            return "Batch Started: " + batchId;
-        } catch (IOException ex) {
-            log.error("ASCII batch initiation failed due to HDFS I/O. configId={}, date={}", configId, date, ex);
-            throw new BatchInitiationException("Unable to scan ASCII input files", ex);
-        }
+        });
+        future.exceptionally((e)->{
+            log.info("Execption Occurred!");
+            return null;
+        });
+        return "Batch Added: " + batchId;
+//        catch (IOException ex) {
+//            log.error("ASCII batch initiation failed due to HDFS I/O. configId={}, date={}", configId, date, ex);
+//            throw new BatchInitiationException("Unable to scan ASCII input files", ex);
+//        }
     }
 
     public Map<String, Object> getBatchStatus(String batchId) {
@@ -151,13 +170,26 @@ public class AsciiGenerationService {
 
             HeaderInfo header = parseHeaderEfficiently(fs, inputPath);
             String branchCode = String.format("%5s", header.branchCode).replace(' ', '0');
-            Path outputFile = new Path(outputDir, branchCode + "." + config.getOutputFileName() + "." + header.reportDate + "." + config.getFileType());
+//            Path outputFile = new Path(outputDir, branchCode + "." + config.getOutputFileName() + "." + header.reportDate + "." + config.getFileType());
+
+            String fileType = config.getFileType();
+            StringBuilder fileNameBuilder = new StringBuilder()
+                    .append(branchCode).append(".")
+                    .append(config.getOutputFileName()).append(".")
+                    .append(header.reportDate);
+
+            if (fileType != null && !fileType.isEmpty()) {
+                fileNameBuilder.append(".").append(fileType);
+            }
+
+            Path outputFile = new Path(outputDir, fileNameBuilder.toString());
+
             String headerLine = config.getOutputFirstLine() + branchCode + header.reportDate + "F";
             List<String> allLines = readAndTransformRecords(fs, inputPath, config);
 
             allLines.sort(Comparator.comparingInt(this::safeLeadingHead));
             writeAsciiOutput(fs, outputFile, headerLine, allLines, config.getOutputEndLine());
-            log.info("ASCII file completed. batchId={}, input={}, output={}, records={}", job.getBatchId(), inputPath, outputFile, allLines.size());
+            log.debug("ASCII file completed. batchId={}, input={}, output={}, records={}", job.getBatchId(), inputPath, outputFile, allLines.size());
         } catch (IOException | IllegalArgumentException ex) {
             throw new FileProcessingException("Unable to process ASCII file " + job.getFilePath() + ": " + ex.getMessage(), ex);
         }

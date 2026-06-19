@@ -11,7 +11,7 @@
 	<groupId>com.tcs.fincore</groupId>
 	<artifactId>AsciiGenerationService</artifactId>
 	<version>0.0.1</version>
-	<name>AsciiGenerationService</name>
+	<name>ascii-generation-service</name>
 	<description>Ascii Generation Service</description>
 	<url/>
 	<licenses>
