@@ -24,5 +24,11 @@ public class TbAsciiBatchRequestPayload {
     )
     private String balanceDate;
 
+    /**
+     * Artifacts to generate. Supported values: TB_ASCII and TB_ASCII_REPORT.
+     * When omitted, both artifacts are generated for backward-compatible full output.
+     */
+    private List<String> generationOptions;
+
     private String exportPath;
 }

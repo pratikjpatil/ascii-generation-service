@@ -4,6 +4,7 @@ import com.google.common.collect.Lists;
 import com.tcs.fincore.AsciiGenerationService.dto.TbAsciiBatchRequestDto;
 import com.tcs.fincore.AsciiGenerationService.dto.TbAsciiBatchRequestPayload;
 import com.tcs.fincore.AsciiGenerationService.dto.TbAsciiGenReqStatusDTO;
+import com.tcs.fincore.AsciiGenerationService.dto.TbAsciiGenerationArtifact;
 import com.tcs.fincore.AsciiGenerationService.exception.PathValidationException;
 import com.tcs.fincore.AsciiGenerationService.exception.TbAsciiGenerationException;
 import com.tcs.fincore.AsciiGenerationService.util.ReportStatus;
@@ -93,6 +94,7 @@ public class TbAsciiService {
 
         List<CompletableFuture<String>> futures = new ArrayList<>();
         ConcurrentHashMap<String, ConcurrentHashMap<String, Integer>> batchStatus = new ConcurrentHashMap<>();
+        EnumSet<TbAsciiGenerationArtifact> artifacts = resolveGenerationArtifacts(payload);
 
         for (String reportId : payload.getReportIds()) {
             TemplateIds templateIds;
@@ -125,7 +127,8 @@ public class TbAsciiService {
                         templateIds.footerId(),
                         templateIds.fileIdentifier(),
                         date,
-                        checkedPathTraversal
+                        checkedPathTraversal,
+                        artifacts
                 ).handle((result, throwable) -> {
                     DB_SEMAPHORE.release();
                     perReportStatus.merge("reports_processed", codes.size(), Integer::sum);
@@ -180,9 +183,10 @@ public class TbAsciiService {
         statusTracker.put(runId, reqStatusDTO);
 
         try {
+            EnumSet<TbAsciiGenerationArtifact> artifacts = resolveGenerationArtifacts(payload);
             LocalDate date = LocalDate.parse(payload.getBalanceDate());
             reqStatusDTO.setStatus(ReportStatus.QUEUED);
-            reqStatusDTO.setMessage(String.format("Batch queued. totalReports=%d", totalReports));
+            reqStatusDTO.setMessage(String.format("Batch queued. totalReports=%d, artifacts=%s", totalReports, artifacts));
             saveAndSendEvent(reqStatusDTO);
             submissionService.submit(() -> processTBAsciiGeneration(reqStatusDTO, payload, runId, date, totalReports));
             return new SingletonMap<>(ReportStatus.QUEUED, String.format("Batch of total:%d reports submitted!", totalReports));
@@ -198,11 +202,36 @@ public class TbAsciiService {
             reqStatusDTO.setMessage("Submission queue is full");
             saveAndSendEvent(reqStatusDTO);
             return new SingletonMap<>(ReportStatus.REJECTED, "Batch generation rejected because prior requests are already queued.");
+        } catch (TbAsciiGenerationException ex) {
+            log.error("Invalid TB ASCII generation request. runId={}", runId, ex);
+            reqStatusDTO.setStatus(ReportStatus.FAILED);
+            reqStatusDTO.setMessage(ex.getMessage());
+            saveAndSendEvent(reqStatusDTO);
+            return new SingletonMap<>(ReportStatus.FAILED, ex.getMessage());
         }
     }
 
     public TbAsciiGenReqStatusDTO getStatus(String runId) {
         return statusTracker.get(runId);
+    }
+
+    private EnumSet<TbAsciiGenerationArtifact> resolveGenerationArtifacts(TbAsciiBatchRequestPayload payload) {
+        List<String> requested = payload.getGenerationOptions();
+        if (requested == null || requested.isEmpty()) {
+            return EnumSet.allOf(TbAsciiGenerationArtifact.class);
+        }
+        EnumSet<TbAsciiGenerationArtifact> artifacts = EnumSet.noneOf(TbAsciiGenerationArtifact.class);
+        for (String option : requested) {
+            try {
+                artifacts.add(TbAsciiGenerationArtifact.from(option));
+            } catch (IllegalArgumentException ex) {
+                throw new TbAsciiGenerationException("Unsupported TB ASCII generation option: " + option, ex);
+            }
+        }
+        if (artifacts.isEmpty()) {
+            throw new TbAsciiGenerationException("At least one TB ASCII generation option is required");
+        }
+        return artifacts;
     }
 
     private TemplateIds parseTemplate(String reportId, String runId) {
