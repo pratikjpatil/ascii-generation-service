@@ -1,5 +1,6 @@
 package com.tcs.fincore.AsciiGenerationService.service;
 
+import com.tcs.fincore.AsciiGenerationService.dto.TbAsciiGenerationArtifact;
 import com.tcs.fincore.AsciiGenerationService.exception.PathValidationException;
 import com.tcs.fincore.AsciiGenerationService.exception.TbAsciiGenerationException;
 import lombok.extern.slf4j.Slf4j;
@@ -26,18 +27,20 @@ import java.sql.Types;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.util.Arrays;
+import java.util.EnumSet;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.stream.Collectors;
 
 @Service
 @Slf4j
 public class TbAsciiGenerationService {
     private static final int MAX_RETRY = 3;
+    private static final int FETCH_SIZE = 5000;
     private static final String BRANCH_CODE_PATTERN = "[A-Za-z0-9_-]{1,20}";
     private static final String REPORT_SEGMENT_PATTERN = "[A-Za-z0-9_-]{1,80}";
+    private static final String REPORT_CSV_HEADER = "REPT_HEAD,HEAD_DESC,CGL,CGL_DESCRIPTION,CURRENCY,BALANCE,CURRENCY_RATE,EQUI_INR_BALANCE,BRANCH_CODE";
 
     @Value("${procedure.ascii.generate}")
     private String generateAsciiProcedureName;
@@ -55,252 +58,224 @@ public class TbAsciiGenerationService {
     public CompletableFuture<String> processBatch(String reportId,
                                                   String runId,
                                                   List<String> branchCodes,
-//                                                  String dateStr,
                                                   String headerId,
                                                   String footerId,
                                                   String fileIdentifier,
                                                   LocalDate date,
-                                                  AtomicBoolean checkedPathTraversal) {
+                                                  AtomicBoolean checkedPathTraversal,
+                                                  EnumSet<TbAsciiGenerationArtifact> artifacts) {
         validateReportId(reportId);
         validateBranchCodes(branchCodes);
         FileSystem hdfs = hdfsService.getFs();
         if (hdfs == null) {
             throw new TbAsciiGenerationException("HDFS Connection Failed");
         }
-
         String safeDate = date.toString();
-        org.apache.hadoop.fs.Path reportDir = resolveReportDirectory(reportId, safeDate);
-        ensureReportDirectory(hdfs, reportDir, checkedPathTraversal, branchCodes);
+        OutputDirectories dirs = resolveOutputDirectories(reportId, safeDate);
+        ensureOutputDirectories(hdfs, dirs, checkedPathTraversal, artifacts, branchCodes);
 
         StringBuilder errorSb = new StringBuilder();
         int retries = 0;
         while (retries < MAX_RETRY) {
             try {
-                generateBatchFiles(hdfs, reportDir, fileIdentifier, runId, branchCodes, date, headerId, footerId, safeDate, errorSb);
+                generateBatchFiles(hdfs, dirs, fileIdentifier, runId, branchCodes, date, headerId, footerId, artifacts, errorSb);
                 break;
             } catch (DataAccessException ex) {
                 retries++;
-                log.error("TB ASCII database failure. reportId={}, runId={}, branches={}, retry={}/{}",
-                        reportId, runId, branchCodes.size(), retries, MAX_RETRY, ex);
+                log.error("TB ASCII database failure. reportId={}, runId={}, branches={}, retry={}/{}", reportId, runId, branchCodes.size(), retries, MAX_RETRY, ex);
                 if (retries >= MAX_RETRY) {
                     throw new TbAsciiGenerationException("DB Connection Failed", ex);
                 }
                 sleepBeforeRetry(retries);
             }
         }
-
         return CompletableFuture.completedFuture(toErrorSummary(errorSb));
     }
 
     private void generateBatchFiles(FileSystem hdfs,
-                                    org.apache.hadoop.fs.Path reportDir,
+                                    OutputDirectories dirs,
                                     String fileIdentifier,
                                     String runId,
                                     List<String> branchCodes,
                                     LocalDate date,
                                     String headerId,
                                     String footerId,
-                                    String safeDate,
+                                    EnumSet<TbAsciiGenerationArtifact> artifacts,
                                     StringBuilder errorSb) {
         jdbcTemplate.execute((Connection conn) -> {
             OracleConnection oracleConnection = conn.unwrap(OracleConnection.class);
             java.sql.Array branchArray = null;
-            int counter = 0;
-            BufferedWriter fileWriter = null;
-            String fileName = null;
-            boolean fileHadWriteError = false;
             try {
                 branchArray = oracleConnection.createOracleArray("TYPE_LIST", branchCodes.toArray(new String[0]));
-                try (CallableStatement cstmt = conn.prepareCall("{call "+generateAsciiProcedureName+"(?, ?, ?, ?,?,?)}")) {
+                try (CallableStatement cstmt = conn.prepareCall("{call " + generateAsciiProcedureName + "(?, ?, ?, ?, ?, ?, ?)}")) {
                     cstmt.setString(1, runId);
                     cstmt.setArray(2, branchArray);
                     cstmt.setDate(3, Date.valueOf(date));
                     cstmt.setString(4, headerId);
                     cstmt.setString(5, footerId);
                     cstmt.registerOutParameter(6, Types.REF_CURSOR);
+                    cstmt.registerOutParameter(7, Types.REF_CURSOR);
                     cstmt.execute();
-
-                    try (ResultSet rs = (ResultSet) cstmt.getObject(6)) {
-                        rs.setFetchSize(1000);
-                        while (rs.next()) {
-                            String line = rs.getString(1);
-                            if (line == null) {
-                                continue;
-                            }
-                            if (line.trim().endsWith("F")) {
-                                closeCurrentWriter(hdfs, reportDir, fileName, fileWriter, fileHadWriteError, errorSb, currentBranch(branchCodes, counter - 1));
-                                fileHadWriteError = false;
-                                if (counter >= branchCodes.size()) {
-                                    appendBranchError(errorSb, 1, "UNKNOWN", "Database returned more branch files than requested");
-                                    break;
-                                }
-                                fileName = buildFileName( branchCodes.get(counter),fileIdentifier,DateTimeFormatter.BASIC_ISO_DATE.format(date));
-                                fileWriter = getFileWriter(reportDir, fileName, hdfs);
-                                counter++;
-                            } else if (fileWriter != null && !fileHadWriteError) {
-                                fileWriter.newLine();
-                            } else {
-                                continue;
-                            }
-                            if (!fileHadWriteError) {
-                                try {
-                                    fileWriter.write(line);
-                                } catch (IOException ex) {
-                                    fileHadWriteError = true;
-                                    appendBranchError(errorSb, 1, currentBranch(branchCodes, counter - 1), "I/O write failed: " + ex.getMessage());
-                                }
-                            }
+                    if (artifacts.contains(TbAsciiGenerationArtifact.TB_ASCII)) {
+                        try (ResultSet asciiRs = (ResultSet) cstmt.getObject(6)) {
+                            writeAsciiFiles(asciiRs, hdfs, dirs.asciiDir(), fileIdentifier, branchCodes, date, errorSb);
+                        }
+                    }
+                    if (artifacts.contains(TbAsciiGenerationArtifact.TB_ASCII_REPORT)) {
+                        try (ResultSet reportRs = (ResultSet) cstmt.getObject(7)) {
+                            writeReportFiles(reportRs, hdfs, dirs.reportDir(), fileIdentifier, date, errorSb);
                         }
                     }
                 }
             } catch (SQLException ex) {
-                closeWriterAfterSqlFailure(hdfs, reportDir, fileName, fileWriter);
-                List<String> failedBranches = branchCodes.subList(Math.max(counter, 0), branchCodes.size());
-                appendBranchError(errorSb, failedBranches.size(), failedBranches.toString(), "Database cursor failed: " + ex.getMessage());
+                appendBranchError(errorSb, branchCodes.size(), branchCodes.toString(), "Database cursor failed: " + ex.getMessage());
                 throw ex;
-            } catch (IOException ex) {
-                closeWriterAfterSqlFailure(hdfs, reportDir, fileName, fileWriter);
-                List<String> failedBranches = branchCodes.subList(Math.max(counter - 1, 0), branchCodes.size());
-                appendBranchError(errorSb, failedBranches.size(), failedBranches.toString(), "HDFS write failed: " + ex.getMessage());
             } finally {
-                closeCurrentWriter(hdfs, reportDir, fileName, fileWriter, fileHadWriteError, errorSb, currentBranch(branchCodes, counter - 1));
                 if (branchArray != null) {
                     branchArray.free();
                 }
-//                log.info("TB ASCII batch cursor consumed. reportId={}, requestedBranches={}, processedBranches={}", fileIdentifier, branchCodes.size(), counter);
             }
             return null;
         });
     }
 
-    private org.apache.hadoop.fs.Path resolveReportDirectory(String reportId, String safeDate) {
+    private void writeAsciiFiles(ResultSet rs, FileSystem hdfs, org.apache.hadoop.fs.Path reportDir, String fileIdentifier,
+                                 List<String> branchCodes, LocalDate date, StringBuilder errorSb) throws SQLException {
+        rs.setFetchSize(FETCH_SIZE);
+        int counter = 0;
+        BufferedWriter writer = null;
+        String fileName = null;
+        boolean writeError = false;
+        try {
+            while (rs.next()) {
+                String line = rs.getString(1);
+                if (line == null) continue;
+                if (line.trim().endsWith("F")) {
+                    closeCurrentWriter(hdfs, reportDir, fileName, writer, writeError, errorSb, currentBranch(branchCodes, counter - 1));
+                    writer = null;
+                    writeError = false;
+                    if (counter >= branchCodes.size()) {
+                        appendBranchError(errorSb, 1, "UNKNOWN", "Database returned more branch files than requested");
+                        break;
+                    }
+                    fileName = buildAsciiFileName(branchCodes.get(counter), fileIdentifier, DateTimeFormatter.BASIC_ISO_DATE.format(date));
+                    writer = getFileWriter(reportDir, fileName, hdfs);
+                    counter++;
+                } else if (writer != null && !writeError) {
+                    writer.newLine();
+                } else {
+                    continue;
+                }
+                if (!writeError) {
+                    writer.write(line);
+                }
+            }
+        } catch (IOException ex) {
+            writeError = true;
+            appendBranchError(errorSb, 1, currentBranch(branchCodes, counter - 1), "ASCII HDFS write failed: " + ex.getMessage());
+        } finally {
+            closeCurrentWriter(hdfs, reportDir, fileName, writer, writeError, errorSb, currentBranch(branchCodes, counter - 1));
+        }
+    }
+
+    private void writeReportFiles(ResultSet rs, FileSystem hdfs, org.apache.hadoop.fs.Path reportDir, String fileIdentifier,
+                                  LocalDate date, StringBuilder errorSb) throws SQLException {
+        rs.setFetchSize(FETCH_SIZE);
+        BufferedWriter writer = null;
+        String currentBranch = null;
+        String fileName = null;
+        boolean writeError = false;
+        try {
+            while (rs.next()) {
+                String branchCode = rs.getString("BRANCH_CODE");
+                if (branchCode == null || !branchCode.equals(currentBranch)) {
+                    closeCurrentWriter(hdfs, reportDir, fileName, writer, writeError, errorSb, currentBranch == null ? "UNKNOWN" : currentBranch);
+                    writer = null;
+                    writeError = false;
+                    currentBranch = branchCode;
+                    fileName = buildReportFileName(branchCode, fileIdentifier, DateTimeFormatter.BASIC_ISO_DATE.format(date));
+                    writer = getFileWriter(reportDir, fileName, hdfs);
+                    writer.write(REPORT_CSV_HEADER);
+                }
+                writer.newLine();
+                writer.write(toCsvRow(rs));
+            }
+        } catch (IOException ex) {
+            writeError = true;
+            appendBranchError(errorSb, 1, currentBranch == null ? "UNKNOWN" : currentBranch, "Report HDFS write failed: " + ex.getMessage());
+        } finally {
+            closeCurrentWriter(hdfs, reportDir, fileName, writer, writeError, errorSb, currentBranch == null ? "UNKNOWN" : currentBranch);
+        }
+    }
+
+    private String toCsvRow(ResultSet rs) throws SQLException {
+        return csv(rs.getString("REPT_HEAD")) + ',' + csv(rs.getString("HEAD_DESC")) + ',' + csv(rs.getString("CGL")) + ','
+                + csv(rs.getString("CGL_DESCRIPTION")) + ',' + csv(rs.getString("CURRENCY")) + ',' + csv(rs.getString("BALANCE")) + ','
+                + csv(rs.getString("CURRENCY_RATE")) + ',' + csv(rs.getString("EQUI_INR_BALANCE")) + ',' + csv(rs.getString("BRANCH_CODE"));
+    }
+
+    private String csv(String value) {
+        if (value == null) return "";
+        String escaped = value.replace("\"", "\"\"");
+        return (escaped.contains(",") || escaped.contains("\n") || escaped.contains("\r") || escaped.contains("\"")) ? "\"" + escaped + "\"" : escaped;
+    }
+
+    private OutputDirectories resolveOutputDirectories(String reportId, String safeDate) {
         String reportSegment = reportId.toLowerCase();
         if (!reportSegment.matches(REPORT_SEGMENT_PATTERN)) {
             throw new PathValidationException("Invalid report id segment for output path: " + reportSegment);
         }
-        return new org.apache.hadoop.fs.Path(basePath + "/" + safeDate + "/tb_ascii_files/" + reportSegment);
+        return new OutputDirectories(
+                new org.apache.hadoop.fs.Path(basePath + "/" + safeDate + "/tb_ascii_files/" + reportSegment),
+                new org.apache.hadoop.fs.Path(basePath + "/" + safeDate + "/tb_ascii_report_files/" + reportSegment)
+        );
     }
 
-    private void ensureReportDirectory(FileSystem hdfs,
-                                       org.apache.hadoop.fs.Path reportDir,
-                                       AtomicBoolean checkedPathTraversal,
-                                       List<String> branchCodes) {
-        if (checkedPathTraversal.compareAndSet(false, true)) {
-            try {
-                String normalized = reportDir.toUri().normalize().getPath();
-                String expectedPrefix = new org.apache.hadoop.fs.Path(basePath + "/" + reportDir.getParent().getParent().getName() + "/tb_ascii_files/").toUri().normalize().getPath();
-                if (normalized == null || expectedPrefix == null || !normalized.startsWith(expectedPrefix)) {
-                    throw new PathValidationException("Path traversal detected for TB ASCII output directory");
-                }
-                if (!hdfs.exists(reportDir)) {
-                    hdfs.mkdirs(reportDir);
-                    log.info("Created TB ASCII output directory. path={}", reportDir);
-                }
-            } catch (IOException ex) {
-                log.error("TB ASCII path creation failed. branchCodes={}", branchCodes, ex);
-                throw new PathValidationException("Unable to create TB ASCII output directory", ex);
-            }
+    private void ensureOutputDirectories(FileSystem hdfs, OutputDirectories dirs, AtomicBoolean checkedPathTraversal,
+                                         EnumSet<TbAsciiGenerationArtifact> artifacts, List<String> branchCodes) {
+        if (!checkedPathTraversal.compareAndSet(false, true)) return;
+        try {
+            if (artifacts.contains(TbAsciiGenerationArtifact.TB_ASCII)) ensureDirectory(hdfs, dirs.asciiDir(), "/tb_ascii_files/");
+            if (artifacts.contains(TbAsciiGenerationArtifact.TB_ASCII_REPORT)) ensureDirectory(hdfs, dirs.reportDir(), "/tb_ascii_report_files/");
+        } catch (IOException ex) {
+            log.error("TB ASCII path creation failed. branchCodes={}", branchCodes, ex);
+            throw new PathValidationException("Unable to create TB ASCII output directory", ex);
         }
     }
 
-    private void validateReportId(String reportId) {
-        if (reportId == null || !reportId.matches(REPORT_SEGMENT_PATTERN)) {
-            throw new PathValidationException("Invalid report id for TB ASCII output file: " + reportId);
+    private void ensureDirectory(FileSystem hdfs, org.apache.hadoop.fs.Path dir, String marker) throws IOException {
+        String normalized = dir.toUri().normalize().getPath();
+        if (normalized == null || !normalized.contains(marker)) {
+            throw new PathValidationException("Path traversal detected for TB ASCII output directory");
         }
+        if (!hdfs.exists(dir)) hdfs.mkdirs(dir);
     }
 
-    private void validateBranchCodes(List<String> branchCodes) {
-        for (String branchCode : branchCodes) {
-            if (branchCode == null || !branchCode.matches(BRANCH_CODE_PATTERN)) {
-                throw new PathValidationException("Invalid branch code for TB ASCII output file: " + branchCode);
-            }
-        }
-    }
-
-    private String buildFileName(String branchCode,String identifier, String safeDate) {
-        return String.format("%s.%s.%s",branchCode,identifier, safeDate);
-    }
+    private void validateReportId(String reportId) { if (reportId == null || !reportId.matches(REPORT_SEGMENT_PATTERN)) throw new PathValidationException("Invalid report id for TB ASCII output file: " + reportId); }
+    private void validateBranchCodes(List<String> branchCodes) { for (String b : branchCodes) if (b == null || !b.matches(BRANCH_CODE_PATTERN)) throw new PathValidationException("Invalid branch code for TB ASCII output file: " + b); }
+    private String buildAsciiFileName(String branchCode, String identifier, String safeDate) { return String.format("%s.%s.%s", branchCode, identifier, safeDate); }
+    private String buildReportFileName(String branchCode, String identifier, String safeDate) { return String.format("%s.%s.%s.csv", branchCode, identifier, safeDate); }
 
     private BufferedWriter getFileWriter(org.apache.hadoop.fs.Path reportDir, String fileName, FileSystem hdfs) throws IOException {
-        if (!hdfs.exists(reportDir)) {
-            hdfs.mkdirs(reportDir);
-            log.info("Created TB ASCII output directory. path={}", reportDir);
-        }
-        org.apache.hadoop.fs.Path targetPath = new org.apache.hadoop.fs.Path(reportDir, fileName);
-        FSDataOutputStream out = hdfs.create(targetPath, true);
-        return new BufferedWriter(new OutputStreamWriter(out, StandardCharsets.UTF_8));
+        if (!hdfs.exists(reportDir)) hdfs.mkdirs(reportDir);
+        FSDataOutputStream out = hdfs.create(new org.apache.hadoop.fs.Path(reportDir, fileName), true);
+        return new BufferedWriter(new OutputStreamWriter(out, StandardCharsets.UTF_8), 1024 * 1024);
     }
 
-    private void closeCurrentWriter(FileSystem hdfs,
-                                    org.apache.hadoop.fs.Path reportDir,
-                                    String fileName,
-                                    BufferedWriter fileWriter,
-                                    boolean deleteFile,
-                                    StringBuilder errorSb,
-                                    String branchCode) {
-        if (fileWriter == null) {
-            return;
-        }
+    private void closeCurrentWriter(FileSystem hdfs, org.apache.hadoop.fs.Path reportDir, String fileName, BufferedWriter writer, boolean deleteFile, StringBuilder errorSb, String branchCode) {
+        if (writer == null) return;
         try {
-            fileWriter.close();
-            if (deleteFile && fileName != null) {
-                hdfs.delete(new org.apache.hadoop.fs.Path(reportDir, fileName), false);
-            }
+            writer.close();
+            if (deleteFile && fileName != null) hdfs.delete(new org.apache.hadoop.fs.Path(reportDir, fileName), false);
         } catch (IOException ex) {
             appendBranchError(errorSb, 1, branchCode, "Unable to close writer: " + ex.getMessage());
             log.error("Failed closing TB ASCII writer. fileName={}, branchCode={}", fileName, branchCode, ex);
         }
     }
 
-    private void closeWriterAfterSqlFailure(FileSystem hdfs, org.apache.hadoop.fs.Path reportDir, String fileName, BufferedWriter fileWriter) {
-        if (fileWriter == null) {
-            return;
-        }
-        try {
-            fileWriter.close();
-            if (fileName != null) {
-                hdfs.delete(new org.apache.hadoop.fs.Path(reportDir, fileName), false);
-            }
-        } catch (IOException ex) {
-            log.error("Failed cleaning partial TB ASCII file after failure. fileName={}", fileName, ex);
-        }
-    }
-
-    private void appendBranchError(StringBuilder errorSb, int count, String branchCode, String reason) {
-        errorSb.append(count)
-                .append("|Error processing TB ASCII for branchCode(s): ")
-                .append(branchCode)
-                .append(", Reason: ")
-                .append(reason)
-                .append(System.lineSeparator());
-    }
-
-    private String toErrorSummary(StringBuilder errorSb) {
-        String errorString = errorSb.toString().trim();
-        if (errorString.isEmpty()) {
-            return null;
-        }
-        AtomicInteger errors = new AtomicInteger();
-        Arrays.stream(errorString.split("\\R")).forEach(line -> {
-            String[] md = line.split("\\|", 2);
-            errors.addAndGet(Integer.parseInt(md[0]));
-        });
-        return errors + System.lineSeparator() + errorString;
-    }
-
-    private String currentBranch(List<String> branchCodes, int index) {
-        if (index < 0 || index >= branchCodes.size()) {
-            return "UNKNOWN";
-        }
-        return branchCodes.get(index);
-    }
-
-    private void sleepBeforeRetry(int retries) {
-        try {
-            Thread.sleep(1000L * (long) Math.pow(2, retries));
-        } catch (InterruptedException ex) {
-            Thread.currentThread().interrupt();
-            throw new TbAsciiGenerationException("DB Connection Failed", ex);
-        }
-    }
+    private void appendBranchError(StringBuilder errorSb, int count, String branchCode, String reason) { errorSb.append(count).append("|Error processing TB ASCII for branchCode(s): ").append(branchCode).append(", Reason: ").append(reason).append(System.lineSeparator()); }
+    private String toErrorSummary(StringBuilder errorSb) { String e = errorSb.toString().trim(); if (e.isEmpty()) return null; AtomicInteger errors = new AtomicInteger(); Arrays.stream(e.split("\\R")).forEach(line -> errors.addAndGet(Integer.parseInt(line.split("\\|", 2)[0]))); return errors + System.lineSeparator() + e; }
+    private String currentBranch(List<String> branchCodes, int index) { return index < 0 || index >= branchCodes.size() ? "UNKNOWN" : branchCodes.get(index); }
+    private void sleepBeforeRetry(int retries) { try { Thread.sleep(1000L * (long) Math.pow(2, retries)); } catch (InterruptedException ex) { Thread.currentThread().interrupt(); throw new TbAsciiGenerationException("DB Connection Failed", ex); } }
+    private record OutputDirectories(org.apache.hadoop.fs.Path asciiDir, org.apache.hadoop.fs.Path reportDir) {}
 }
