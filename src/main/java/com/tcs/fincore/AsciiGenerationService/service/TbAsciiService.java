@@ -5,13 +5,11 @@ import com.tcs.fincore.AsciiGenerationService.dto.TbAsciiBatchRequestDto;
 import com.tcs.fincore.AsciiGenerationService.dto.TbAsciiBatchRequestPayload;
 import com.tcs.fincore.AsciiGenerationService.dto.TbAsciiGenReqStatusDTO;
 import com.tcs.fincore.AsciiGenerationService.dto.TbAsciiGenerationArtifact;
-import com.tcs.fincore.AsciiGenerationService.exception.PathValidationException;
 import com.tcs.fincore.AsciiGenerationService.exception.TbAsciiGenerationException;
 import com.tcs.fincore.AsciiGenerationService.util.ReportStatus;
 import jakarta.annotation.PreDestroy;
+import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.collections4.map.SingletonMap;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.dao.DataAccessException;
@@ -21,23 +19,11 @@ import org.springframework.jdbc.core.SqlParameter;
 import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
 import org.springframework.jdbc.core.simple.SimpleJdbcCall;
 import org.springframework.kafka.core.KafkaTemplate;
-import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 
-import java.io.BufferedWriter;
-import java.io.IOException;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
-import java.sql.CallableStatement;
-import java.sql.Connection;
-import java.sql.ResultSet;
-import java.sql.SQLException;
 import java.sql.Types;
 import java.time.Instant;
 import java.time.LocalDate;
-import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
 import java.util.*;
 import java.util.concurrent.*;
@@ -45,6 +31,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
+@Slf4j
 @Service
 public class TbAsciiService {
 
@@ -52,14 +39,11 @@ public class TbAsciiService {
     private String parseTemplateProcedure;
 
     private static final String TOPIC = "tb_ascii-report-generation-request-status";
-    private static final Logger log = LoggerFactory.getLogger(TbAsciiService.class);
     private static final Semaphore DB_SEMAPHORE = new Semaphore(15, true);
     private static final int BATCH_SIZE = 100;
+
     private final ExecutorService submissionService = new ThreadPoolExecutor(
-            1,
-            1,
-            0L,
-            TimeUnit.SECONDS,
+            1, 1, 0L, TimeUnit.SECONDS,
             new ArrayBlockingQueue<>(3),
             new ThreadPoolExecutor.AbortPolicy()
     );
@@ -68,7 +52,6 @@ public class TbAsciiService {
     private final TbAsciiGenerationService tbAsciiGenerationService;
     private final KafkaTemplate<String, Object> kafkaTemplate;
     private final ConcurrentHashMap<String, TbAsciiGenReqStatusDTO> statusTracker = new ConcurrentHashMap<>();
-//    private final LinkedHashMap<String, ConcurrentHashMap<String,Object>> lastFewStatus= new LinkedHashMap<>();
 
     @Autowired
     public TbAsciiService(JdbcTemplate jdbcTemplate,
@@ -79,8 +62,6 @@ public class TbAsciiService {
         this.kafkaTemplate = kafkaTemplate;
     }
 
-
-
     private void processTBAsciiGeneration(TbAsciiGenReqStatusDTO reqStatusDTO,
                                           TbAsciiBatchRequestPayload payload,
                                           String runId,
@@ -88,6 +69,7 @@ public class TbAsciiService {
                                           int totalReports) {
         long startTime = System.nanoTime();
         AtomicInteger connectionFailure = new AtomicInteger(0);
+
         reqStatusDTO.setStatus(ReportStatus.GENERATING);
         reqStatusDTO.setStartTime(Instant.now().toString());
         saveAndSendEvent(reqStatusDTO);
@@ -96,18 +78,20 @@ public class TbAsciiService {
         ConcurrentHashMap<String, ConcurrentHashMap<String, Integer>> batchStatus = new ConcurrentHashMap<>();
         EnumSet<TbAsciiGenerationArtifact> artifacts = resolveGenerationArtifacts(payload);
 
+        // Iterate through all reportIds provided in the payload
         for (String reportId : payload.getReportIds()) {
             TemplateIds templateIds;
             try {
+                // The DB procedure now uses reportId instead of the request runId
                 templateIds = parseTemplate(reportId, runId);
             } catch (TbAsciiGenerationException ex) {
-                log.error("Skipping TB ASCII report because template parsing failed. reportId={}, runId={}", reportId, runId, ex);
+                log.error("Skipping TB ASCII report because template parsing failed. reportId={}, trackingRunId={}", reportId, runId, ex);
                 futures.add(CompletableFuture.completedFuture(reportId + "!" + payload.getBranchCodes().size()
                         + System.lineSeparator() + ex.getMessage()));
                 continue;
             }
+
             log.info("Generating TB ASCII report. reportId={}, branches={}, batchSize={}", reportId, payload.getBranchCodes().size(), BATCH_SIZE);
-            log.info("TB ASCII Procedure name parseTemplate: {} ",parseTemplateProcedure);
             ConcurrentHashMap<String, Integer> perReportStatus = new ConcurrentHashMap<>();
             perReportStatus.put("reports_processed", 0);
             batchStatus.put(reportId, perReportStatus);
@@ -118,11 +102,11 @@ public class TbAsciiService {
                     break;
                 }
                 acquireDbPermit(runId, reportId, codes.size());
+
                 futures.add(tbAsciiGenerationService.processBatch(
                         reportId,
-                        runId,
+                        runId, // Passed purely for logging traceability
                         codes,
-//                        payload.getBalanceDate(),
                         templateIds.headerId(),
                         templateIds.footerId(),
                         templateIds.fileIdentifier(),
@@ -132,6 +116,7 @@ public class TbAsciiService {
                 ).handle((result, throwable) -> {
                     DB_SEMAPHORE.release();
                     perReportStatus.merge("reports_processed", codes.size(), Integer::sum);
+
                     if (throwable != null) {
                         if (throwable.getMessage() != null && throwable.getMessage().contains("Connection Failed")) {
                             connectionFailure.incrementAndGet();
@@ -148,7 +133,7 @@ public class TbAsciiService {
                 }));
             }
             if (connectionFailure.get() >= 3) {
-                log.error("Stopping TB ASCII submission because repeated connection failures occurred. runId={}", runId);
+                log.error("Stopping TB ASCII submission because repeated connection failures occurred. trackingRunId={}", runId);
                 break;
             }
         }
@@ -160,11 +145,11 @@ public class TbAsciiService {
             reqStatusDTO.setStatus(resolveFinalStatus(result, totalReports));
         } catch (InterruptedException ex) {
             Thread.currentThread().interrupt();
-            log.error("TB ASCII aggregation interrupted. runId={}", runId, ex);
+            log.error("TB ASCII aggregation interrupted. trackingRunId={}", runId, ex);
             reqStatusDTO.setStatus(ReportStatus.FAILED);
             reqStatusDTO.setMessage("TB ASCII aggregation interrupted");
         } catch (ExecutionException ex) {
-            log.error("TB ASCII aggregation failed. runId={}", runId, ex);
+            log.error("TB ASCII aggregation failed. trackingRunId={}", runId, ex);
             reqStatusDTO.setStatus(ReportStatus.FAILED);
             reqStatusDTO.setMessage("TB ASCII aggregation failed: " + ex.getMessage());
         }
@@ -172,14 +157,14 @@ public class TbAsciiService {
         reqStatusDTO.setEndTime(Instant.now().toString());
         saveAndSendEvent(reqStatusDTO);
         long durationInMillis = (System.nanoTime() - startTime) / 1_000_000;
-        log.info("Completed TB ASCII batch. runId={}, status={}, durationMs={}", runId, reqStatusDTO.getStatus(), durationInMillis);
+        log.info("Completed TB ASCII batch. trackingRunId={}, status={}, durationMs={}", runId, reqStatusDTO.getStatus(), durationInMillis);
     }
 
     public SingletonMap<ReportStatus, String> generateFiles(TbAsciiBatchRequestDto req, String creationMethod) {
         TbAsciiBatchRequestPayload payload = req.getPayload();
         int totalReports = payload.getReportIds().size() * payload.getBranchCodes().size();
-        TbAsciiGenReqStatusDTO reqStatusDTO = new TbAsciiGenReqStatusDTO(req.getProcessRunId(), req.getStageId(), req.getRunId(), req.getType(), creationMethod);
         String runId = buildRunId(req);
+        TbAsciiGenReqStatusDTO reqStatusDTO = new TbAsciiGenReqStatusDTO(req.getProcessRunId(), req.getStageId(), req.getRunId(), req.getType(), creationMethod);
         statusTracker.put(runId, reqStatusDTO);
 
         try {
@@ -197,13 +182,13 @@ public class TbAsciiService {
             saveAndSendEvent(reqStatusDTO);
             return new SingletonMap<>(ReportStatus.FAILED, "Invalid Date Provided!");
         } catch (RejectedExecutionException ex) {
-            log.error("TB ASCII request rejected because submission queue is full. runId={}", runId, ex);
+            log.error("TB ASCII request rejected because submission queue is full. trackingRunId={}", runId, ex);
             reqStatusDTO.setStatus(ReportStatus.REJECTED);
             reqStatusDTO.setMessage("Submission queue is full");
             saveAndSendEvent(reqStatusDTO);
             return new SingletonMap<>(ReportStatus.REJECTED, "Batch generation rejected because prior requests are already queued.");
         } catch (TbAsciiGenerationException ex) {
-            log.error("Invalid TB ASCII generation request. runId={}", runId, ex);
+            log.error("Invalid TB ASCII generation request. trackingRunId={}", runId, ex);
             reqStatusDTO.setStatus(ReportStatus.FAILED);
             reqStatusDTO.setMessage(ex.getMessage());
             saveAndSendEvent(reqStatusDTO);
@@ -234,7 +219,7 @@ public class TbAsciiService {
         return artifacts;
     }
 
-    private TemplateIds parseTemplate(String reportId, String runId) {
+    private TemplateIds parseTemplate(String reportId, String trackingRunId) {
         SimpleJdbcCall jdbcCall = new SimpleJdbcCall(jdbcTemplate)
                 .withProcedureName(parseTemplateProcedure)
                 .declareParameters(
@@ -242,21 +227,23 @@ public class TbAsciiService {
                         new SqlParameter("p_run_id", Types.VARCHAR),
                         new SqlOutParameter("p_header_id", Types.VARCHAR),
                         new SqlOutParameter("p_footer_id", Types.VARCHAR),
-                        new SqlOutParameter("p_file_identifier",Types.VARCHAR)
+                        new SqlOutParameter("p_file_identifier", Types.VARCHAR)
                 );
+
         MapSqlParameterSource in = new MapSqlParameterSource()
                 .addValue("p_report_id", reportId)
-                .addValue("p_run_id", runId);
+                .addValue("p_run_id", reportId);
+
         try {
             Map<String, Object> out = jdbcCall.execute(in);
-            log.info("Parsed TB ASCII template. reportId={}, runId={}", reportId, runId);
+            log.info("Parsed TB ASCII template. reportId={}, trackingRunId={}", reportId, trackingRunId);
             return new TemplateIds(
                     (String) out.get("p_header_id"),
                     (String) out.get("p_footer_id"),
                     (String) out.get("p_file_identifier")
             );
         } catch (DataAccessException ex) {
-            log.error("Failed parsing TB ASCII template. reportId={}, runId={}", reportId, runId, ex);
+            log.error("Failed parsing TB ASCII template. reportId={}, trackingRunId={}", reportId, trackingRunId, ex);
             throw new TbAsciiGenerationException("Unable to parse TB template for report: " + reportId, ex);
         }
     }
@@ -335,7 +322,7 @@ public class TbAsciiService {
             DB_SEMAPHORE.acquire();
         } catch (InterruptedException ex) {
             Thread.currentThread().interrupt();
-            throw new TbAsciiGenerationException("Interrupted while waiting for DB permit. runId=" + runId + ", reportId=" + reportId + ", batchSize=" + batchSize, ex);
+            throw new TbAsciiGenerationException("Interrupted while waiting for DB permit. trackingRunId=" + runId + ", reportId=" + reportId + ", batchSize=" + batchSize, ex);
         }
     }
 
@@ -361,13 +348,6 @@ public class TbAsciiService {
 
     private void saveAndSendEvent(TbAsciiGenReqStatusDTO status) {
         statusTracker.put(status.compositeRunId(), status);
-//        SequencedSet<String> statusKeySet=lastFewStatus.sequencedKeySet();
-//        if(!statusKeySet.contains(status.compositeRunId())) {
-//            if (lastFewStatus.size() >= 5) {
-//                lastFewStatus.remove(statusKeySet.getFirst());
-//            }
-//        }
-//        lastFewStatus.put(status.compositeRunId(), status);
         if ("KAFKA-Scheduled".equalsIgnoreCase(status.getCreationMethod())) {
             kafkaTemplate.send(TOPIC, status).whenComplete((res, err) -> {
                 if (err != null) {
@@ -379,6 +359,6 @@ public class TbAsciiService {
         }
     }
 
-    private record TemplateIds(String headerId, String footerId,String fileIdentifier) {
+    private record TemplateIds(String headerId, String footerId, String fileIdentifier) {
     }
 }

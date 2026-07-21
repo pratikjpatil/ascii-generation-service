@@ -25,6 +25,7 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Types;
 import java.time.LocalDate;
+import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.Arrays;
 import java.util.EnumSet;
@@ -36,11 +37,15 @@ import java.util.concurrent.atomic.AtomicInteger;
 @Service
 @Slf4j
 public class TbAsciiGenerationService {
+
     private static final int MAX_RETRY = 3;
     private static final int FETCH_SIZE = 5000;
     private static final String BRANCH_CODE_PATTERN = "[A-Za-z0-9_-]{1,20}";
     private static final String REPORT_SEGMENT_PATTERN = "[A-Za-z0-9_-]{1,80}";
-    private static final String REPORT_CSV_HEADER = "REPT_HEAD,HEAD_DESC,CGL,CGL_DESCRIPTION,CURRENCY,BALANCE,CURRENCY_RATE,EQUI_INR_BALANCE,BRANCH_CODE";
+    private static final String REPORT_CSV_HEADER = "REPT_HEAD,HEAD_DESC,CGL,CGL_DESCRIPTION,CURRENCY,BALANCE,CURRENCY_RATE,EQUI_INR_BALANCE";
+
+    private static final DateTimeFormatter RUN_DATE_FORMATTER = DateTimeFormatter.ofPattern("yyyy/MM/dd HH:mm:ss");
+    private static final DateTimeFormatter REPORT_DATE_FORMATTER = DateTimeFormatter.ofPattern("yyyy/MM/dd");
 
     @Value("${procedure.ascii.generate}")
     private String generateAsciiProcedureName;
@@ -56,7 +61,7 @@ public class TbAsciiGenerationService {
 
     @Async("tbTaskExecutor")
     public CompletableFuture<String> processBatch(String reportId,
-                                                  String runId,
+                                                  String trackingRunId, // Used for logging
                                                   List<String> branchCodes,
                                                   String headerId,
                                                   String footerId,
@@ -67,22 +72,26 @@ public class TbAsciiGenerationService {
         validateReportId(reportId);
         validateBranchCodes(branchCodes);
         FileSystem hdfs = hdfsService.getFs();
+
         if (hdfs == null) {
             throw new TbAsciiGenerationException("HDFS Connection Failed");
         }
+
         String safeDate = date.toString();
         OutputDirectories dirs = resolveOutputDirectories(reportId, safeDate);
         ensureOutputDirectories(hdfs, dirs, checkedPathTraversal, artifacts, branchCodes);
 
         StringBuilder errorSb = new StringBuilder();
         int retries = 0;
+
         while (retries < MAX_RETRY) {
             try {
-                generateBatchFiles(hdfs, dirs, fileIdentifier, runId, branchCodes, date, headerId, footerId, artifacts, errorSb);
+                // Pass reportId to be used as the DB execution identifier
+                generateBatchFiles(hdfs, dirs, fileIdentifier, reportId, trackingRunId, branchCodes, date, headerId, footerId, artifacts, errorSb);
                 break;
             } catch (DataAccessException ex) {
                 retries++;
-                log.error("TB ASCII database failure. reportId={}, runId={}, branches={}, retry={}/{}", reportId, runId, branchCodes.size(), retries, MAX_RETRY, ex);
+                log.error("TB ASCII database failure. reportId={}, trackingRunId={}, branches={}, retry={}/{}", reportId, trackingRunId, branchCodes.size(), retries, MAX_RETRY, ex);
                 if (retries >= MAX_RETRY) {
                     throw new TbAsciiGenerationException("DB Connection Failed", ex);
                 }
@@ -95,7 +104,8 @@ public class TbAsciiGenerationService {
     private void generateBatchFiles(FileSystem hdfs,
                                     OutputDirectories dirs,
                                     String fileIdentifier,
-                                    String runId,
+                                    String reportId,
+                                    String trackingRunId,
                                     List<String> branchCodes,
                                     LocalDate date,
                                     String headerId,
@@ -108,14 +118,18 @@ public class TbAsciiGenerationService {
             try {
                 branchArray = oracleConnection.createOracleArray("TYPE_LIST", branchCodes.toArray(new String[0]));
                 try (CallableStatement cstmt = conn.prepareCall("{call " + generateAsciiProcedureName + "(?, ?, ?, ?, ?, ?, ?)}")) {
-                    cstmt.setString(1, runId);
+
+                    // Bind reportId here instead of the trackingRunId
+                    cstmt.setString(1, reportId);
                     cstmt.setArray(2, branchArray);
                     cstmt.setDate(3, Date.valueOf(date));
                     cstmt.setString(4, headerId);
                     cstmt.setString(5, footerId);
                     cstmt.registerOutParameter(6, Types.REF_CURSOR);
                     cstmt.registerOutParameter(7, Types.REF_CURSOR);
+
                     cstmt.execute();
+
                     if (artifacts.contains(TbAsciiGenerationArtifact.TB_ASCII)) {
                         try (ResultSet asciiRs = (ResultSet) cstmt.getObject(6)) {
                             writeAsciiFiles(asciiRs, hdfs, dirs.asciiDir(), fileIdentifier, branchCodes, date, errorSb);
@@ -185,6 +199,10 @@ public class TbAsciiGenerationService {
         String currentBranch = null;
         String fileName = null;
         boolean writeError = false;
+
+        String reportName = resolveReportName(fileIdentifier);
+        String reportDate = date.format(REPORT_DATE_FORMATTER);
+
         try {
             while (rs.next()) {
                 String branchCode = rs.getString("BRANCH_CODE");
@@ -195,6 +213,22 @@ public class TbAsciiGenerationService {
                     currentBranch = branchCode;
                     fileName = buildReportFileName(branchCode, fileIdentifier, DateTimeFormatter.BASIC_ISO_DATE.format(date));
                     writer = getFileWriter(reportDir, fileName, hdfs);
+
+                    writer.write(",,,State Bank of India");
+                    writer.newLine();
+                    writer.newLine();
+
+                    writer.write("Report Name," + csv(reportName));
+                    writer.newLine();
+                    writer.write("Report Date," + reportDate);
+                    writer.newLine();
+                    writer.write("Run Date," + LocalDateTime.now().format(RUN_DATE_FORMATTER));
+                    writer.newLine();
+                    writer.write("Branch Code," + csv(branchCode));
+                    writer.newLine();
+
+                    writer.newLine();
+
                     writer.write(REPORT_CSV_HEADER);
                 }
                 writer.newLine();
@@ -208,10 +242,25 @@ public class TbAsciiGenerationService {
         }
     }
 
+    private String resolveReportName(String fileIdentifier) {
+        if (fileIdentifier == null) return "Unknown Trial Balance Report";
+        return switch (fileIdentifier) {
+            case "TBY" -> "YSA Trial Balance Report";
+            case "TBNWSA" -> "NWSA Trial Balance Report";
+            case "TBP" -> "PNL Trial Balance Report";
+            default -> fileIdentifier + " Trial Balance Report";
+        };
+    }
+
     private String toCsvRow(ResultSet rs) throws SQLException {
-        return csv(rs.getString("REPT_HEAD")) + ',' + csv(rs.getString("HEAD_DESC")) + ',' + csv(rs.getString("CGL")) + ','
-                + csv(rs.getString("CGL_DESCRIPTION")) + ',' + csv(rs.getString("CURRENCY")) + ',' + csv(rs.getString("BALANCE")) + ','
-                + csv(rs.getString("CURRENCY_RATE")) + ',' + csv(rs.getString("EQUI_INR_BALANCE")) + ',' + csv(rs.getString("BRANCH_CODE"));
+        return csv(rs.getString("REPT_HEAD")) + ','
+                + csv(rs.getString("HEAD_DESC")) + ','
+                + csv(rs.getString("CGL")) + ','
+                + csv(rs.getString("CGL_DESCRIPTION")) + ','
+                + csv(rs.getString("CURRENCY")) + ','
+                + csv(rs.getString("BALANCE")) + ','
+                + csv(rs.getString("CURRENCY_RATE")) + ','
+                + csv(rs.getString("EQUI_INR_BALANCE"));
     }
 
     private String csv(String value) {
@@ -254,7 +303,7 @@ public class TbAsciiGenerationService {
     private void validateReportId(String reportId) { if (reportId == null || !reportId.matches(REPORT_SEGMENT_PATTERN)) throw new PathValidationException("Invalid report id for TB ASCII output file: " + reportId); }
     private void validateBranchCodes(List<String> branchCodes) { for (String b : branchCodes) if (b == null || !b.matches(BRANCH_CODE_PATTERN)) throw new PathValidationException("Invalid branch code for TB ASCII output file: " + b); }
     private String buildAsciiFileName(String branchCode, String identifier, String safeDate) { return String.format("%s.%s.%s", branchCode, identifier, safeDate); }
-    private String buildReportFileName(String branchCode, String identifier, String safeDate) { return String.format("%s.%s.%s.csv", branchCode, identifier, safeDate); }
+    private String buildReportFileName(String branchCode, String identifier, String safeDate) { return String.format("%s.%s.%s_report.csv", branchCode, identifier, safeDate); }
 
     private BufferedWriter getFileWriter(org.apache.hadoop.fs.Path reportDir, String fileName, FileSystem hdfs) throws IOException {
         if (!hdfs.exists(reportDir)) hdfs.mkdirs(reportDir);
@@ -277,5 +326,6 @@ public class TbAsciiGenerationService {
     private String toErrorSummary(StringBuilder errorSb) { String e = errorSb.toString().trim(); if (e.isEmpty()) return null; AtomicInteger errors = new AtomicInteger(); Arrays.stream(e.split("\\R")).forEach(line -> errors.addAndGet(Integer.parseInt(line.split("\\|", 2)[0]))); return errors + System.lineSeparator() + e; }
     private String currentBranch(List<String> branchCodes, int index) { return index < 0 || index >= branchCodes.size() ? "UNKNOWN" : branchCodes.get(index); }
     private void sleepBeforeRetry(int retries) { try { Thread.sleep(1000L * (long) Math.pow(2, retries)); } catch (InterruptedException ex) { Thread.currentThread().interrupt(); throw new TbAsciiGenerationException("DB Connection Failed", ex); } }
+
     private record OutputDirectories(org.apache.hadoop.fs.Path asciiDir, org.apache.hadoop.fs.Path reportDir) {}
 }

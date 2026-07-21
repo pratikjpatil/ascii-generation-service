@@ -27,14 +27,10 @@ import java.io.OutputStreamWriter;
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.time.LocalDate;
+import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
-import java.util.ArrayList;
-import java.util.Comparator;
-import java.util.List;
-import java.util.Map;
-import java.util.Optional;
-import java.util.UUID;
+import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Matcher;
@@ -178,18 +174,19 @@ public class AsciiGenerationService {
                     .append(config.getOutputFileName()).append(".")
                     .append(header.reportDate);
 
+
             if (fileType != null && !fileType.isEmpty()) {
                 fileNameBuilder.append(".").append(fileType);
             }
-
+            log.info("Filename : {}",fileNameBuilder.toString());
             Path outputFile = new Path(outputDir, fileNameBuilder.toString());
 
             String headerLine = config.getOutputFirstLine() + branchCode + header.reportDate + "F";
             List<String> allLines = readAndTransformRecords(fs, inputPath, config);
 
             allLines.sort(Comparator.comparingInt(this::safeLeadingHead));
-            writeAsciiOutput(fs, outputFile, headerLine, allLines, config.getOutputEndLine());
-            log.debug("ASCII file completed. batchId={}, input={}, output={}, records={}", job.getBatchId(), inputPath, outputFile, allLines.size());
+            writeAsciiOutput(fs, outputFile, headerLine, allLines, config.getOutputEndLine(), config.getOutputPerLineHead());
+            log.info("ASCII file completed. batchId={}, input={}, output={}, records={}", job.getBatchId(), inputPath, outputFile, allLines.size());
         } catch (IOException | IllegalArgumentException ex) {
             throw new FileProcessingException("Unable to process ASCII file " + job.getFilePath() + ": " + ex.getMessage(), ex);
         }
@@ -218,15 +215,55 @@ public class AsciiGenerationService {
         return allLines;
     }
 
-    private void writeAsciiOutput(FileSystem fs, Path outputFile, String headerLine, List<String> records, String footerLine) throws IOException {
+//    private void writeAsciiOutput(FileSystem fs, Path outputFile, String headerLine, List<String> records, String footerLine) throws IOException {
+//        try (BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(fs.create(outputFile, true), StandardCharsets.UTF_8))) {
+//            writer.write(headerLine);
+//            writer.newLine();
+//            for (String record : records) {
+//                writer.write(record);
+//                writer.newLine();
+//            }
+//            if (footerLine != null) {
+//                writer.write(footerLine);
+//            }
+//        }
+//    }
+
+    private void writeAsciiOutput(FileSystem fs, Path outputFile, String headerLine, List<String> records, String footerLine, Integer outputPerLineHead) throws IOException {
+        // Default to 1 item per line if config is missing or invalid
+        int itemsPerLine = (outputPerLineHead != null && outputPerLineHead > 0) ? outputPerLineHead : 1;
+
         try (BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(fs.create(outputFile, true), StandardCharsets.UTF_8))) {
+            // Write Header
             writer.write(headerLine);
             writer.newLine();
+
+            StringBuilder currentLineBuffer = new StringBuilder();
+            int currentItemCount = 0;
+
             for (String record : records) {
-                writer.write(record);
+                currentLineBuffer.append(record);
+                currentItemCount++;
+
+                // When we reach the configured number of heads per line, flush to file
+                if (currentItemCount == itemsPerLine) {
+                    writer.write(currentLineBuffer.toString());
+                    writer.newLine();
+
+                    // Reset buffer and counter for the next line
+                    currentLineBuffer.setLength(0);
+                    currentItemCount = 0;
+                }
+            }
+
+            // Flush any remaining items that didn't form a complete batch
+            if (currentItemCount > 0) {
+                writer.write(currentLineBuffer.toString());
                 writer.newLine();
             }
-            if (footerLine != null) {
+
+            // Write Footer if present
+            if (footerLine != null && !footerLine.isEmpty()) {
                 writer.write(footerLine);
             }
         }
@@ -410,7 +447,7 @@ public class AsciiGenerationService {
 
     private String normalizeDate(String d) {
         try {
-            return LocalDate.parse(d, DateTimeFormatter.ofPattern("yyyy-MM-dd")).format(DateTimeFormatter.ofPattern("ddMMyyyy"));
+            return LocalDate.parse(d, DateTimeFormatter.ofPattern("yyyy-MM-dd")).format(DateTimeFormatter.ofPattern("yyyyMMdd"));
         } catch (DateTimeParseException ex) {
             log.warn("Invalid report date found in ASCII header. value={}", d);
             return "";
