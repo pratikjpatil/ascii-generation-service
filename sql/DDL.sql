@@ -86,7 +86,8 @@ CREATE TABLE "ASCII_CONFIG"
     "OUTPUT_AMT_SIGN"         VARCHAR2(4000),
     "OUTPUT_PER_LINE_HEAD"    NUMBER,
     "CREATED_DATE"            TIMESTAMP(6)     DEFAULT SYSDATE,
-    "OUTPUT_INCLUDE_CONDITION" VARCHAR2(4000)
+    "OUTPUT_INCLUDE_CONDITION" VARCHAR2(4000),
+    "OUTPUT_LAYOUT"             VARCHAR2(50)     DEFAULT 'STANDARD'
 );
 
 CREATE UNIQUE INDEX "SYS_C0010374" ON "ASCII_CONFIG" ("ID");
@@ -148,6 +149,9 @@ COMMENT ON COLUMN "ASCII_CONFIG"."CREATED_DATE" IS
 
 COMMENT ON COLUMN "ASCII_CONFIG"."OUTPUT_INCLUDE_CONDITION" IS
     'Expression that gates whether a transformed amount value is included in the ASCII output line. Rows where no amount passes this condition are suppressed entirely. Eg. ["^.*"][3][!=0]';
+
+COMMENT ON COLUMN "ASCII_CONFIG"."OUTPUT_LAYOUT" IS
+    'Selects the output writer strategy. STANDARD keeps existing header/detail/footer behavior. PFORM_BID_AMOUNT_SERIES writes one fixed record with YYYYMM + branch + configured constant text followed by bid amounts for bid numbers 1 through 1500, inserting signed zeroes for missing bids.';
 
 
 -- =============================================================================

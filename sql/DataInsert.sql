@@ -29,3 +29,8 @@ Insert into ASCII_MASTER (ID,ASCII_NAME,LOCATION,FREQUENCY) values (104,'PNL ASC
 Insert into ASCII_MASTER (ID,ASCII_NAME,LOCATION,FREQUENCY) values (105,'Trial Balance YSA ASCII','reports/{date}/tb_ascii_files/ysa_report',null);
 Insert into ASCII_MASTER (ID,ASCII_NAME,LOCATION,FREQUENCY) values (106,'Trial Balance PNL ASCII','reports/{date}/tb_ascii_files/pnl_report',null);
 Insert into ASCII_MASTER (ID,ASCII_NAME,LOCATION,FREQUENCY) values (107,'Trail Balance NWSA ASCII','reports/{date}/tb_ascii_files/nwsa_report','D');
+
+REM INSERTING PFORM one-line bid amount ASCII config
+SET DEFINE OFF;
+Insert into ASCII_CONFIG (ID,REPORT_ID,FILE_TYPE,OUTPUT_FILE_NAME,OUTPUT_FIRST_LINE,OUTPUT_END_LINE,INPUT_HEAD_COL,INPUT_HEAD_REGEX,OUTPUT_HEAD_COL_PAD,AMOUNT_COL_SEQ,OUTPUT_AMT_COL_LOGIC,OUTPUT_AMT_DECIMAL,OUTPUT_AMT_COL_PAD,OUTPUT_AMT_SIGN,OUTPUT_PER_LINE_HEAD,CREATED_DATE,OUTPUT_INCLUDE_CONDITION,OUTPUT_LAYOUT) values (108,'pform_report',null,'PFORM','M  000NNN',null,1,'^\d{1,4}$',null,'2','["^.*"][2][/1000]','["^.*"][2][ceil]',null,null,null,SYSTIMESTAMP,null,'PFORM_BID_AMOUNT_SERIES');
+Insert into ASCII_MASTER (ID,ASCII_NAME,LOCATION,FREQUENCY) values (108,'PFORM One Line Bid Amount ASCII','reports/{date}/ascii_files/pform_report','M');
