@@ -58,4 +58,7 @@ public class AsciiConfig {
 
     @Column(name = "OUTPUT_INCLUDE_CONDITION")
     private String outputIncludeCondition;
+
+    @Column(name = "OUTPUT_LAYOUT")
+    private String outputLayout;
 }

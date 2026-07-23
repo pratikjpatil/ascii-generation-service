@@ -25,6 +25,7 @@ import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.OutputStreamWriter;
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.nio.charset.StandardCharsets;
 import java.time.LocalDate;
 import java.time.ZoneId;
@@ -181,12 +182,18 @@ public class AsciiGenerationService {
             log.info("Filename : {}",fileNameBuilder.toString());
             Path outputFile = new Path(outputDir, fileNameBuilder.toString());
 
-            String headerLine = config.getOutputFirstLine() + branchCode + header.reportDate + "F";
-            List<String> allLines = readAndTransformRecords(fs, inputPath, config);
+            int outputRecords;
+            if (AsciiOutputLayout.PFORM_BID_AMOUNT_SERIES.matches(config.getOutputLayout())) {
+                outputRecords = writePformBidAmountSeries(fs, inputPath, outputFile, config, header, branchCode);
+            } else {
+                String headerLine = config.getOutputFirstLine() + branchCode + header.reportDate + "F";
+                List<String> allLines = readAndTransformRecords(fs, inputPath, config);
 
-            allLines.sort(Comparator.comparingInt(this::safeLeadingHead));
-            writeAsciiOutput(fs, outputFile, headerLine, allLines, config.getOutputEndLine(), config.getOutputPerLineHead());
-            log.info("ASCII file completed. batchId={}, input={}, output={}, records={}", job.getBatchId(), inputPath, outputFile, allLines.size());
+                allLines.sort(Comparator.comparingInt(this::safeLeadingHead));
+                writeAsciiOutput(fs, outputFile, headerLine, allLines, config.getOutputEndLine(), config.getOutputPerLineHead());
+                outputRecords = allLines.size();
+            }
+            log.info("ASCII file completed. batchId={}, input={}, output={}, records={}", job.getBatchId(), inputPath, outputFile, outputRecords);
         } catch (IOException | IllegalArgumentException ex) {
             throw new FileProcessingException("Unable to process ASCII file " + job.getFilePath() + ": " + ex.getMessage(), ex);
         }
@@ -267,6 +274,83 @@ public class AsciiGenerationService {
                 writer.write(footerLine);
             }
         }
+    }
+
+    private int writePformBidAmountSeries(FileSystem fs, Path inputPath, Path outputFile, AsciiConfig config, HeaderInfo header, String branchCode) throws IOException {
+        PformBidAmountSeries series = readPformBidAmountSeries(fs, inputPath, config);
+        String record = buildPformBidAmountRecord(header.reportDate, branchCode, config.getOutputFirstLine(), series);
+
+        try (BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(fs.create(outputFile, true), StandardCharsets.UTF_8))) {
+            writer.write(record);
+        }
+        return 1;
+    }
+
+    private PformBidAmountSeries readPformBidAmountSeries(FileSystem fs, Path inputPath, AsciiConfig config) throws IOException {
+        PformBidAmountSeries series = new PformBidAmountSeries(1500);
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(fs.open(inputPath), StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                try {
+                    String[] columns = line.split("\\|", -1);
+                    if (!isValidRow(columns, config)) {
+                        continue;
+                    }
+
+                    int bidNumber = parseBidNumber(columns, config);
+                    if (!series.isSupportedBidNumber(bidNumber)) {
+                        log.warn("Skipping PFORM row with out-of-range bid number. inputFile={}, bidNumber={}", inputPath, bidNumber);
+                        continue;
+                    }
+
+                    BigDecimal amount = extractSingleConfiguredAmount(columns, config);
+                    amount = RuleParser.applyMathLogic(amount, String.valueOf(bidNumber), getSingleAmountColumnIndex(config), config.getOutputAmtColLogic());
+                    amount = RuleParser.applyDecimalLogic(amount, String.valueOf(bidNumber), getSingleAmountColumnIndex(config), config.getOutputAmtDecimal());
+                    series.put(bidNumber, amount);
+                } catch (IllegalArgumentException | ArithmeticException ex) {
+                    log.error("Skipping invalid PFORM ASCII row. inputFile={}, row={}, reason={}", inputPath, line, ex.getMessage(), ex);
+                }
+            }
+        }
+        return series;
+    }
+
+    private String buildPformBidAmountRecord(String reportDate, String branchCode, String constantText, PformBidAmountSeries series) {
+        String normalizedDate = reportDate != null && reportDate.length() >= 6 ? reportDate.substring(0, 6) : "";
+        StringBuilder record = new StringBuilder(normalizedDate).append(branchCode).append(constantText == null ? "" : constantText);
+        for (int bidNumber = 1; bidNumber <= series.maxBidNumber(); bidNumber++) {
+            record.append(formatPformAmount(series.getOrZero(bidNumber)));
+        }
+        return record.toString();
+    }
+
+    private String formatPformAmount(BigDecimal amount) {
+        BigDecimal rounded = amount == null ? BigDecimal.ZERO : amount.setScale(0, RoundingMode.CEILING);
+        String digits = rounded.abs().toPlainString();
+        if (digits.length() > 11) {
+            throw new IllegalArgumentException("PFORM amount exceeds 11 digits after rounding: " + digits);
+        }
+        return (rounded.signum() < 0 ? "-" : "+") + String.format("%011d", rounded.abs().longValueExact());
+    }
+
+    private int parseBidNumber(String[] columns, AsciiConfig config) {
+        int idx = config.getInputHeadCol() - 1;
+        if (idx < 0 || idx >= columns.length) {
+            throw new IllegalArgumentException("Configured bid-number column is not present in row");
+        }
+        return Integer.parseInt(columns[idx].trim());
+    }
+
+    private BigDecimal extractSingleConfiguredAmount(String[] columns, AsciiConfig config) {
+        return parseAmount(columns, getSingleAmountColumnIndex(config) - 1);
+    }
+
+    private int getSingleAmountColumnIndex(AsciiConfig config) {
+        String seq = config.getAmountColSeq();
+        if (seq == null || !seq.trim().matches("\\d+")) {
+            throw new IllegalArgumentException("PFORM layout requires AMOUNT_COL_SEQ to contain one numeric amount column");
+        }
+        return Integer.parseInt(seq.trim());
     }
 
     private int safeLeadingHead(String record) {
@@ -451,6 +535,40 @@ public class AsciiGenerationService {
         } catch (DateTimeParseException ex) {
             log.warn("Invalid report date found in ASCII header. value={}", d);
             return "";
+        }
+    }
+
+    private enum AsciiOutputLayout {
+        STANDARD,
+        PFORM_BID_AMOUNT_SERIES;
+
+        private boolean matches(String configuredLayout) {
+            return name().equalsIgnoreCase(configuredLayout == null ? STANDARD.name() : configuredLayout.trim());
+        }
+    }
+
+    private static class PformBidAmountSeries {
+        private final BigDecimal[] amountsByBidNumber;
+
+        PformBidAmountSeries(int maxBidNumber) {
+            this.amountsByBidNumber = new BigDecimal[maxBidNumber + 1];
+        }
+
+        boolean isSupportedBidNumber(int bidNumber) {
+            return bidNumber > 0 && bidNumber < amountsByBidNumber.length;
+        }
+
+        void put(int bidNumber, BigDecimal amount) {
+            amountsByBidNumber[bidNumber] = amount;
+        }
+
+        BigDecimal getOrZero(int bidNumber) {
+            BigDecimal amount = amountsByBidNumber[bidNumber];
+            return amount == null ? BigDecimal.ZERO : amount;
+        }
+
+        int maxBidNumber() {
+            return amountsByBidNumber.length - 1;
         }
     }
 
