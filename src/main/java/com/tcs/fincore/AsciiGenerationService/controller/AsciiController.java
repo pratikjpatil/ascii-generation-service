@@ -1,6 +1,5 @@
 package com.tcs.fincore.AsciiGenerationService.controller;
 
-import com.tcs.fincore.AsciiGenerationService.dto.ReportGenerationResponseDTO;
 import com.tcs.fincore.AsciiGenerationService.dto.ReportRequest;
 import com.tcs.fincore.AsciiGenerationService.exception.BatchInitiationException;
 import com.tcs.fincore.AsciiGenerationService.exception.ConfigNotFoundException;
@@ -43,7 +42,7 @@ public class AsciiController {
         }
 
         try {
-            String status = service.initiateBatch(id, request.getReportDate(), buildRestEventTemplate(request));
+            String status = service.initiateBatch(id, request.getReportDate());
             return ResponseEntity.accepted().body("Success: " + status);
         } catch (ConfigNotFoundException ex) {
             return ResponseEntity.badRequest().body("Error: " + ex.getMessage());
@@ -61,11 +60,4 @@ public class AsciiController {
         return ResponseEntity.ok(status);
     }
 
-    private ReportGenerationResponseDTO buildRestEventTemplate(ReportRequest request) {
-        ReportGenerationResponseDTO event = new ReportGenerationResponseDTO();
-        event.setType("NORMAL_ASCII");
-        event.setId(request.getId());
-        event.setReportDate(request.getReportDate());
-        return event;
-    }
 }

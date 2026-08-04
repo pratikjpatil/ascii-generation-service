@@ -27,6 +27,7 @@ import java.io.OutputStreamWriter;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.nio.charset.StandardCharsets;
+import java.time.Instant;
 import java.time.LocalDate;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
@@ -86,8 +87,10 @@ public class AsciiGenerationService {
     public String initiateBatch(Long configId, String date, ReportGenerationResponseDTO eventTemplate) {
         String batchId = UUID.randomUUID().toString();
         CompletableFuture<Object> future = new CompletableFuture<>();
-        submissionService.submit(() -> {
-            try {
+        sendBatchEvent(batchId, Constants.STARTED, "Batch trigger accepted", eventTemplate);
+        try {
+            submissionService.submit(() -> {
+                try {
                 AsciiConfig config = loadConfig(configId);
                 FileSystem fs = hdfsService.getFs();
                 String reportId = config.getReportId();
@@ -106,13 +109,14 @@ public class AsciiGenerationService {
 
                 if (foundFiles.isEmpty()) {
                     log.warn("No PSV input files found. configId={}, reportId={}, date={}, path={}", configId, reportId, date, baseDir);
+                    updateBatchStatus(batchId, Constants.FAILED, 0, 0, 0, "No PSV input files found");
+                    sendBatchEvent(batchId, Constants.FAILED, "No PSV input files found", eventTemplate);
                     return future.complete(null);
                 }
 
 //            String batchId = UUID.randomUUID().toString();
                 BATCH_TRACKER.put(batchId, new BatchStats(foundFiles.size(), eventTemplate));
-                updateBatchStatus(batchId, Constants.GENERATING, foundFiles.size(), 0, foundFiles.size(), "Batch started");
-                sendBatchEvent(batchId, Constants.GENERATING, "Batch started with " + foundFiles.size() + " files", eventTemplate);
+                updateBatchStatus(batchId, Constants.STARTED, foundFiles.size(), 0, foundFiles.size(), "Batch started");
 
                 for (Path p : foundFiles) {
                     jobQueueManager.submitFileJob(new FileJob(configId, p, batchId, date));
@@ -121,11 +125,18 @@ public class AsciiGenerationService {
 
                 log.info("ASCII batch started. batchId={}, configId={}, reportId={}, filesQueued={}", batchId, configId, reportId, foundFiles.size());
                 return future.complete(null);
-            } catch (IOException ex) {
-                log.error("ASCII batch initiation failed due to HDFS I/O. configId={}, date={}", configId, date, ex);
+                } catch (IOException | RuntimeException ex) {
+                log.error("ASCII batch initiation failed. configId={}, date={}", configId, date, ex);
+                updateBatchStatus(batchId, Constants.FAILED, 0, 0, 0, ex.getMessage());
+                sendBatchEvent(batchId, Constants.FAILED, ex.getMessage(), eventTemplate);
                 return future.complete(ex);
-            }
-        });
+                }
+            });
+        } catch (RejectedExecutionException ex) {
+            updateBatchStatus(batchId, Constants.FAILED, 0, 0, 0, "Submission queue is full");
+            sendBatchEvent(batchId, Constants.FAILED, "Submission queue is full", eventTemplate);
+            throw new BatchInitiationException("Submission queue is full", ex);
+        }
         future.exceptionally((e) -> {
             log.info("Execption Occurred!");
             return null;
@@ -398,7 +409,7 @@ public class AsciiGenerationService {
         updateBatchStatus(job.getBatchId(), Constants.GENERATING, stats.totalFiles, stats.failedFiles.get(), remaining, "Batch processing");
         if (remaining == 0) {
             int failed = stats.failedFiles.get();
-            String status = failed == 0 ? Constants.SUCCESS : (failed < stats.totalFiles ? Constants.PARTIAL_SUCCESS : Constants.FAILED);
+            String status = failed == 0 ? Constants.COMPLETED : Constants.FAILED;
             long durationMs = System.currentTimeMillis() - stats.startTime;
             String remark = String.format("Batch completed. totalFiles=%d, failedFiles=%d, durationMs=%d", stats.totalFiles, failed, durationMs);
             if (reason != null && failed == stats.totalFiles) {
@@ -427,12 +438,16 @@ public class AsciiGenerationService {
             return;
         }
         ReportGenerationResponseDTO event = new ReportGenerationResponseDTO();
-        event.setProcessRunId(template.getProcessRunId());
+        event.setProcessId(template.getProcessId());
         event.setStageId(template.getStageId());
         event.setRunId(template.getRunId());
-        event.setType(template.getType());
-        event.setId(template.getId());
-        event.setReportDate(template.getReportDate());
+        event.setReportType(template.getReportType());
+        event.setPayload(template.getPayload());
+        event.setReportTriggered(Boolean.TRUE);
+        event.setStartTime(template.getStartTime());
+        if (!Constants.STARTED.equals(status)) {
+            event.setEndTime(Instant.now().toString());
+        }
         event.setStatus(status);
         event.setRemark(remark + "; batchId=" + batchId);
         producer.sendResponse(event);
