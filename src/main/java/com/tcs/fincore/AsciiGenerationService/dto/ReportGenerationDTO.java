@@ -1,40 +1,47 @@
 package com.tcs.fincore.AsciiGenerationService.dto;
 
-
+import com.fasterxml.jackson.annotation.JsonAlias;
+import com.fasterxml.jackson.databind.JsonNode;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
-import jakarta.validation.Valid;
 import lombok.Data;
 
 @Data
 public class ReportGenerationDTO {
 
-    @NotNull(message = "Process Run Id Cannot be null")
-    private String processRunId;
+    @JsonAlias({"processRunId"})
+    @NotNull(message = "Process Id Cannot be null")
+    @NotBlank(message = "Process Id Cannot be blank")
+    private String processId;
 
     @NotNull(message = "Stage Id Cannot be null")
     @NotBlank(message = "Stage Id Cannot be Blank")
     private String stageId;
 
     @NotNull(message = "Run Id Cannot be null")
-    private Integer runId;
+    private String runId;
 
-
+    @JsonAlias({"type"})
     @NotNull(message = "Report Type Cannot be null")
     @NotBlank(message = "Report Type Cannot be blank")
-    private String type;
-    
-    @Valid
-    @NotNull
-    private Payload payload;
-    @Data
-    public static class Payload
-    {
-        @NotNull(message = "Id cannot be null")
-        private String id;
+    private String reportType;
 
-        @NotNull(message = "Report Date cannot be blank")
-        private String reportDate;
+    @NotNull(message = "Payload Cannot be null")
+    private JsonNode payload;
+
+    public String getProcessRunId() {
+        return processId;
     }
 
+    public void setProcessRunId(String processRunId) {
+        this.processId = processRunId;
+    }
+
+    public String getType() {
+        return reportType;
+    }
+
+    public void setType(String type) {
+        this.reportType = type;
+    }
 }

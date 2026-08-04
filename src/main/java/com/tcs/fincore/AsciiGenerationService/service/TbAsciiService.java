@@ -1,11 +1,14 @@
 package com.tcs.fincore.AsciiGenerationService.service;
 
 import com.google.common.collect.Lists;
+import com.tcs.fincore.AsciiGenerationService.dto.ReportGenerationResponseDTO;
 import com.tcs.fincore.AsciiGenerationService.dto.TbAsciiBatchRequestDto;
 import com.tcs.fincore.AsciiGenerationService.dto.TbAsciiBatchRequestPayload;
 import com.tcs.fincore.AsciiGenerationService.dto.TbAsciiGenReqStatusDTO;
 import com.tcs.fincore.AsciiGenerationService.dto.TbAsciiGenerationArtifact;
 import com.tcs.fincore.AsciiGenerationService.exception.TbAsciiGenerationException;
+import com.tcs.fincore.AsciiGenerationService.kafka.ReportKafkaProducer;
+import com.tcs.fincore.AsciiGenerationService.util.Constants;
 import com.tcs.fincore.AsciiGenerationService.util.ReportStatus;
 import jakarta.annotation.PreDestroy;
 import lombok.extern.slf4j.Slf4j;
@@ -51,28 +54,33 @@ public class TbAsciiService {
     private final JdbcTemplate jdbcTemplate;
     private final TbAsciiGenerationService tbAsciiGenerationService;
     private final KafkaTemplate<String, Object> kafkaTemplate;
+    private final ReportKafkaProducer reportKafkaProducer;
     private final ConcurrentHashMap<String, TbAsciiGenReqStatusDTO> statusTracker = new ConcurrentHashMap<>();
 
     @Autowired
     public TbAsciiService(JdbcTemplate jdbcTemplate,
                           KafkaTemplate<String, Object> kafkaTemplate,
+                          ReportKafkaProducer reportKafkaProducer,
                           TbAsciiGenerationService tbAsciiGenerationService) {
         this.jdbcTemplate = jdbcTemplate;
         this.tbAsciiGenerationService = tbAsciiGenerationService;
         this.kafkaTemplate = kafkaTemplate;
+        this.reportKafkaProducer = reportKafkaProducer;
     }
 
     private void processTBAsciiGeneration(TbAsciiGenReqStatusDTO reqStatusDTO,
                                           TbAsciiBatchRequestPayload payload,
                                           String runId,
                                           LocalDate date,
-                                          int totalReports) {
+                                          int totalReports,
+                                          ReportGenerationResponseDTO eventTemplate) {
         long startTime = System.nanoTime();
         AtomicInteger connectionFailure = new AtomicInteger(0);
 
         reqStatusDTO.setStatus(ReportStatus.GENERATING);
         reqStatusDTO.setStartTime(Instant.now().toString());
         saveAndSendEvent(reqStatusDTO);
+        publishLifecycleEvent(eventTemplate, Constants.STARTED, "TB report generation started", null);
 
         List<CompletableFuture<String>> futures = new ArrayList<>();
         ConcurrentHashMap<String, ConcurrentHashMap<String, Integer>> batchStatus = new ConcurrentHashMap<>();
@@ -156,11 +164,16 @@ public class TbAsciiService {
 
         reqStatusDTO.setEndTime(Instant.now().toString());
         saveAndSendEvent(reqStatusDTO);
+        publishLifecycleEvent(eventTemplate, ReportStatus.SUCCESS.name().equals(reqStatusDTO.getStatus()) ? Constants.COMPLETED : Constants.FAILED, reqStatusDTO.getMessage(), reqStatusDTO.getEndTime());
         long durationInMillis = (System.nanoTime() - startTime) / 1_000_000;
         log.info("Completed TB ASCII batch. trackingRunId={}, status={}, durationMs={}", runId, reqStatusDTO.getStatus(), durationInMillis);
     }
 
     public SingletonMap<ReportStatus, String> generateFiles(TbAsciiBatchRequestDto req, String creationMethod) {
+        return generateFiles(req, creationMethod, null);
+    }
+
+    public SingletonMap<ReportStatus, String> generateFiles(TbAsciiBatchRequestDto req, String creationMethod, ReportGenerationResponseDTO eventTemplate) {
         TbAsciiBatchRequestPayload payload = req.getPayload();
         int totalReports = payload.getReportIds().size() * payload.getBranchCodes().size();
         String runId = buildRunId(req);
@@ -173,25 +186,28 @@ public class TbAsciiService {
             reqStatusDTO.setStatus(ReportStatus.QUEUED);
             reqStatusDTO.setMessage(String.format("Batch queued. totalReports=%d, artifacts=%s", totalReports, artifacts));
             saveAndSendEvent(reqStatusDTO);
-            submissionService.submit(() -> processTBAsciiGeneration(reqStatusDTO, payload, runId, date, totalReports));
+            submissionService.submit(() -> processTBAsciiGeneration(reqStatusDTO, payload, runId, date, totalReports, eventTemplate));
             return new SingletonMap<>(ReportStatus.QUEUED, String.format("Batch of total:%d reports submitted!", totalReports));
         } catch (DateTimeParseException ex) {
             log.error("Invalid TB ASCII date. date={}", payload.getBalanceDate(), ex);
             reqStatusDTO.setStatus(ReportStatus.FAILED);
             reqStatusDTO.setMessage("Invalid Date");
             saveAndSendEvent(reqStatusDTO);
+            publishLifecycleEvent(eventTemplate, Constants.FAILED, reqStatusDTO.getMessage(), Instant.now().toString());
             return new SingletonMap<>(ReportStatus.FAILED, "Invalid Date Provided!");
         } catch (RejectedExecutionException ex) {
             log.error("TB ASCII request rejected because submission queue is full. trackingRunId={}", runId, ex);
             reqStatusDTO.setStatus(ReportStatus.REJECTED);
             reqStatusDTO.setMessage("Submission queue is full");
             saveAndSendEvent(reqStatusDTO);
+            publishLifecycleEvent(eventTemplate, Constants.FAILED, reqStatusDTO.getMessage(), Instant.now().toString());
             return new SingletonMap<>(ReportStatus.REJECTED, "Batch generation rejected because prior requests are already queued.");
         } catch (TbAsciiGenerationException ex) {
             log.error("Invalid TB ASCII generation request. trackingRunId={}", runId, ex);
             reqStatusDTO.setStatus(ReportStatus.FAILED);
             reqStatusDTO.setMessage(ex.getMessage());
             saveAndSendEvent(reqStatusDTO);
+            publishLifecycleEvent(eventTemplate, Constants.FAILED, reqStatusDTO.getMessage(), Instant.now().toString());
             return new SingletonMap<>(ReportStatus.FAILED, ex.getMessage());
         }
     }
@@ -357,6 +373,24 @@ public class TbAsciiService {
                 }
             });
         }
+    }
+
+    private void publishLifecycleEvent(ReportGenerationResponseDTO template, String status, String remark, String endTime) {
+        if (template == null) {
+            return;
+        }
+        ReportGenerationResponseDTO event = new ReportGenerationResponseDTO();
+        event.setProcessId(template.getProcessId());
+        event.setStageId(template.getStageId());
+        event.setRunId(template.getRunId());
+        event.setReportType(template.getReportType());
+        event.setPayload(template.getPayload());
+        event.setReportTriggered(Boolean.TRUE);
+        event.setStartTime(template.getStartTime());
+        event.setEndTime(endTime);
+        event.setStatus(status);
+        event.setRemark(remark);
+        reportKafkaProducer.sendResponse(event);
     }
 
     private record TemplateIds(String headerId, String footerId, String fileIdentifier) {
