@@ -20,42 +20,6 @@ import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.messaging.handler.annotation.Payload;
 import org.springframework.stereotype.Service;
 
-// @Slf4j
-// @Service
-// @RequiredArgsConstructor
-// @Validated
-// public class ReportKafkaConsumer {
-//
-//     private final KafkaService kafkaService;
-//     private final ReportKafkaProducer producer;
-//
-//     @KafkaListener(topics = "report-generation-request", groupId = "Airflow_ETL", properties = {
-//             "spring.json.value.default.type=com.fincore.ReportService.dto.ReportGenerationDTO" })
-//     public void consume(@Valid ReportGenerationDTO request) {
-//
-//         try {
-//             log.info("Report Generation Request Recieved:{} ", request);
-//             kafkaService.processReport(request);
-//
-//         }
-//         catch (CallNotPermittedException e) {
-//             log.error("Circuit Breaker is OPEN. Skipping/Retrying later for RunId: {}", request.getRunId());
-//
-//         }
-//
-//         catch (ConstraintViolationException e) {
-//             log.info("Constraint Violation {}",e.getMessage());
-//             ReportGenerationResponseDTO response = new ReportGenerationResponseDTO();
-//             response.setRunId(request.getRunId());
-//             response.setProcessRunId(request.getProcessRunId());
-//             response.setStageId(request.getStageId());
-//             response.setStatus(Constants.FAILED);
-//             response.setRemark("Validation Failed " + e.getMessage());
-//             producer.sendResponse(response);
-//         }
-//
-//     }
-// }
  
 @Slf4j
 @Service

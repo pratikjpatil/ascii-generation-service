@@ -117,26 +117,28 @@ public class TbAsciiGenerationService {
             java.sql.Array branchArray = null;
             try {
                 branchArray = oracleConnection.createOracleArray("TYPE_LIST", branchCodes.toArray(new String[0]));
-                try (CallableStatement cstmt = conn.prepareCall("{call " + generateAsciiProcedureName + "(?, ?, ?, ?, ?, ?, ?)}")) {
+                String procedureName = generateAsciiProcedureName.trim();
+                String sqlCall = "{call " + procedureName + "(?, ?, ?, ?, ?, ?, ?, ?)}";
 
-                    // Bind reportId here instead of the trackingRunId
+                try (CallableStatement cstmt = conn.prepareCall(sqlCall)) {
                     cstmt.setString(1, reportId);
-                    cstmt.setArray(2, branchArray);
-                    cstmt.setDate(3, Date.valueOf(date));
-                    cstmt.setString(4, headerId);
-                    cstmt.setString(5, footerId);
-                    cstmt.registerOutParameter(6, Types.REF_CURSOR);
+                    cstmt.setString(2, reportId);
+                    cstmt.setArray(3, branchArray);
+                    cstmt.setDate(4, Date.valueOf(date));
+                    cstmt.setString(5, headerId);
+                    cstmt.setString(6, footerId);
                     cstmt.registerOutParameter(7, Types.REF_CURSOR);
+                    cstmt.registerOutParameter(8, Types.REF_CURSOR);
 
                     cstmt.execute();
 
                     if (artifacts.contains(TbAsciiGenerationArtifact.TB_ASCII)) {
-                        try (ResultSet asciiRs = (ResultSet) cstmt.getObject(6)) {
+                        try (ResultSet asciiRs = (ResultSet) cstmt.getObject(7)) {
                             writeAsciiFiles(asciiRs, hdfs, dirs.asciiDir(), fileIdentifier, branchCodes, date, errorSb);
                         }
                     }
                     if (artifacts.contains(TbAsciiGenerationArtifact.TB_ASCII_REPORT)) {
-                        try (ResultSet reportRs = (ResultSet) cstmt.getObject(7)) {
+                        try (ResultSet reportRs = (ResultSet) cstmt.getObject(8)) {
                             writeReportFiles(reportRs, hdfs, dirs.reportDir(), fileIdentifier, date, errorSb);
                         }
                     }

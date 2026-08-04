@@ -42,7 +42,7 @@ import java.util.regex.Pattern;
 @RequiredArgsConstructor
 public class AsciiGenerationService {
 
-//    private final AsciiGenerationService asciiService;
+    //    private final AsciiGenerationService asciiService;
     private final AsciiConfigRepository configRepo;
     private final JobQueueManager jobQueueManager;
     private final HdfsService hdfsService;
@@ -126,7 +126,7 @@ public class AsciiGenerationService {
                 return future.complete(ex);
             }
         });
-        future.exceptionally((e)->{
+        future.exceptionally((e) -> {
             log.info("Execption Occurred!");
             return null;
         });
@@ -179,7 +179,7 @@ public class AsciiGenerationService {
             if (fileType != null && !fileType.isEmpty()) {
                 fileNameBuilder.append(".").append(fileType);
             }
-            log.info("Filename : {}",fileNameBuilder.toString());
+            log.info("Filename : {}", fileNameBuilder.toString());
             Path outputFile = new Path(outputDir, fileNameBuilder.toString());
 
             int outputRecords;
@@ -324,13 +324,35 @@ public class AsciiGenerationService {
         return record.toString();
     }
 
+//    private String formatPformAmount(BigDecimal amount) {
+//        BigDecimal rounded = amount == null ? BigDecimal.ZERO : amount.setScale(0, RoundingMode.CEILING);
+//        String digits = rounded.abs().toPlainString();
+//        if (digits.length() > 11) {
+
+    /// /            throw new IllegalArgumentException("PFORM amount exceeds 11 digits after rounding: " + digits);
+//        }
+//        return (rounded.signum() < 0 ? "-" : "+") + String.format("%011d", rounded.abs().longValueExact());
+//    }
+
+
     private String formatPformAmount(BigDecimal amount) {
+        // Handle null and round to whole number
         BigDecimal rounded = amount == null ? BigDecimal.ZERO : amount.setScale(0, RoundingMode.CEILING);
+
+        // Get absolute value as a plain string (no scientific notation)
         String digits = rounded.abs().toPlainString();
+
+        // Trim from the left if length > 11
         if (digits.length() > 11) {
-            throw new IllegalArgumentException("PFORM amount exceeds 11 digits after rounding: " + digits);
+            digits = digits.substring(digits.length() - 11);
         }
-        return (rounded.signum() < 0 ? "-" : "+") + String.format("%011d", rounded.abs().longValueExact());
+
+        // Determine sign based on the ORIGINAL rounded value
+        String sign = (rounded.signum() < 0) ? "-" : "+";
+
+        // Return formatted string (digits is already max 11 chars, but pad if smaller)
+        long value = Long.parseLong(digits);
+        return sign + String.format("%011d", value);
     }
 
     private int parseBidNumber(String[] columns, AsciiConfig config) {
