@@ -1,11 +1,12 @@
 package com.tcs.fincore.AsciiGenerationService.dto;
 
 import com.tcs.fincore.AsciiGenerationService.util.ReportStatus;
+import lombok.Data;
 import lombok.Getter;
 
 import java.util.Map;
 
-@Getter
+@Data
 public class TbAsciiGenReqStatusDTO {
     private final String processRunId;
     private final String stageId;
@@ -37,19 +38,4 @@ public class TbAsciiGenReqStatusDTO {
         return processRunId + "_" + stageId + "_" + runId;
     }
 
-    public void setEndTime(String endTime) {
-        this.endTime = endTime;
-    }
-
-    public void setStartTime(String startTime) {
-        this.startTime = startTime;
-    }
-
-    public void setMetrics(Map<String, Map<String, Object>> metrics) {
-        this.metrics = metrics;
-    }
-
-    public void setMessage(String message) {
-        this.message = message;
-    }
 }

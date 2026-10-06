@@ -4,23 +4,18 @@ import com.tcs.fincore.AsciiGenerationService.dto.ReportGenerationDTO;
 import com.tcs.fincore.AsciiGenerationService.dto.ReportGenerationResponseDTO;
 import com.tcs.fincore.AsciiGenerationService.service.KafkaService;
 import com.tcs.fincore.AsciiGenerationService.util.Constants;
-
-//import io.github.resilience4j.circuitbreaker.CallNotPermittedException;
-import jakarta.validation.Valid;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-
-import java.util.Set;
-import java.util.stream.Collectors;
-
 import jakarta.validation.ConstraintViolation;
 import jakarta.validation.Validator;
-
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.messaging.handler.annotation.Payload;
 import org.springframework.stereotype.Service;
 
- 
+import java.time.Instant;
+import java.util.Set;
+import java.util.stream.Collectors;
+
 @Slf4j
 @Service
 @RequiredArgsConstructor
@@ -30,42 +25,40 @@ public class ReportKafkaConsumer {
     private final ReportKafkaProducer producer;
     private final Validator validator;
 
-
-    @KafkaListener(topics = "ascii-report-generation-request", groupId = "Airflow_ETL",
-    properties = {
-            "spring.json.value.default.type=com.tcs.fincore.AsciiGenerationService.dto.ReportGenerationDTO"}
-    )
-    public void consume(@Valid @Payload ReportGenerationDTO request) {
-        log.info("Received ASCII Report Generation Request: {}", request);
-        log.info("Payload object: {}",request.getPayload());
-        ReportGenerationResponseDTO response = new ReportGenerationResponseDTO();
-        try {
-            Set<ConstraintViolation<ReportGenerationDTO>> violations = validator.validate(request);
-            if (!violations.isEmpty()) {
-                String errorMessage = violations.stream()
-                        .map(ConstraintViolation::getMessage)
-                        .collect(Collectors.joining(", "));
-                log.error("Validation Failed: {}", errorMessage);
-                response.setRunId(request.getRunId());
-                response.setProcessRunId(request.getProcessRunId());
-                response.setStageId(request.getStageId());
-                response.setStatus(Constants.FAILED);
-                response.setRemark("Validation Failed: " + errorMessage);
-
-
-               producer.sendResponse(response);
-                return;
-            }
-            kafkaService.processReport(request);
-        } catch (RuntimeException e) {
-            log.error("Processing Failed for RunId {}: {}", request.getRunId(), e.getMessage(), e);
-            response.setRunId(request.getRunId());
-            response.setProcessRunId(request.getProcessRunId());
-            response.setStageId(request.getStageId());
-            response.setStatus(Constants.FAILED);
-            response.setRemark("Processing Failed: " + e.getMessage());
-
-           producer.sendResponse(response);
+    @KafkaListener(topics = "${app.kafka.report.request-topic:ascii.report-generation.trigger}",
+            groupId = "${spring.kafka.consumer.group-id:report-generation-group}",
+            properties = "spring.json.value.default.type=com.tcs.fincore.AsciiGenerationService.dto.ReportGenerationDTO")
+    public void consume(@Payload ReportGenerationDTO request) {
+        log.info("Received report generation Kafka request. processId={}, stageId={}, runId={}, reportType={}",
+                request == null ? null : request.getProcessRunId(), request == null ? null : request.getStageId(),
+                request == null ? null : request.getRunId(), request == null ? null : request.getReportType());
+        if (request == null) {
+            producer.sendResponse(failedEvent(null, "Validation Failed: request body is missing"));
+            return;
         }
+        Set<ConstraintViolation<ReportGenerationDTO>> violations = validator.validate(request);
+        if (!violations.isEmpty()) {
+            String errorMessage = violations.stream().map(ConstraintViolation::getMessage).collect(Collectors.joining(", "));
+            log.error("Kafka report generation request validation failed: {}", errorMessage);
+            producer.sendResponse(failedEvent(request, "Validation Failed: " + errorMessage));
+            return;
+        }
+        kafkaService.processReport(request);
+    }
+
+    private ReportGenerationResponseDTO failedEvent(ReportGenerationDTO request, String remark) {
+        ReportGenerationResponseDTO event = new ReportGenerationResponseDTO();
+        if (request != null) {
+            event.setProcessRunId(request.getProcessRunId());
+            event.setStageId(request.getStageId());
+            event.setRunId(request.getRunId());
+            event.setReportType(request.getReportType());
+//            event.setPayload(request.getPayload());
+        }
+        event.setReportTriggered(Boolean.FALSE);
+        event.setStatus(Constants.FAILED);
+        event.setRemarks(remark);
+        event.setEndTime(Instant.now().toString());
+        return event;
     }
 }

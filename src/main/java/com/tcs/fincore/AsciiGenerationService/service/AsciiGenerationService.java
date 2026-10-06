@@ -27,6 +27,7 @@ import java.io.OutputStreamWriter;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.nio.charset.StandardCharsets;
+import java.time.Instant;
 import java.time.LocalDate;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
@@ -52,14 +53,7 @@ public class AsciiGenerationService {
     private static final Map<String, BatchStats> BATCH_TRACKER = new ConcurrentHashMap<>();
     private static final Map<String, Map<String, Object>> ASCII_STATUS_TRACKER = new ConcurrentHashMap<>();
 
-    private final ThreadPoolExecutor submissionService = new ThreadPoolExecutor(
-            1,
-            1,
-            0L,
-            TimeUnit.SECONDS,
-            new ArrayBlockingQueue<>(3),
-            new ThreadPoolExecutor.AbortPolicy()
-    );
+    private final ThreadPoolExecutor submissionService = new ThreadPoolExecutor(1, 1, 0L, TimeUnit.SECONDS, new ArrayBlockingQueue<>(3), new ThreadPoolExecutor.AbortPolicy());
 
     private static class BatchStats {
         private final long startTime;
@@ -86,46 +80,56 @@ public class AsciiGenerationService {
     public String initiateBatch(Long configId, String date, ReportGenerationResponseDTO eventTemplate) {
         String batchId = UUID.randomUUID().toString();
         CompletableFuture<Object> future = new CompletableFuture<>();
-        submissionService.submit(() -> {
-            try {
-                AsciiConfig config = loadConfig(configId);
-                FileSystem fs = hdfsService.getFs();
-                String reportId = config.getReportId();
-                Path baseDir = new Path(basePath + "/" + date + "/" + reportId);
+        sendBatchEvent(batchId, Constants.STARTED, "Batch trigger accepted", eventTemplate);
+        try {
+            submissionService.submit(() -> {
+                try {
+                    AsciiConfig config = loadConfig(configId);
+                    FileSystem fs = hdfsService.getFs();
+                    String reportId = config.getReportId();
+                    Path baseDir = new Path(basePath + "/" + date + "/" + reportId);
 
-                log.info("Scanning ASCII input directory. configId={}, reportId={}, date={}, path={}", configId, reportId, date, baseDir);
-                RemoteIterator<LocatedFileStatus> files = fs.listFiles(baseDir, true);
-                List<Path> foundFiles = new ArrayList<>(35_000);
+                    log.info("Scanning ASCII input directory. configId={}, reportId={}, date={}, path={}", configId, reportId, date, baseDir);
+                    RemoteIterator<LocatedFileStatus> files = fs.listFiles(baseDir, true);
+                    List<Path> foundFiles = new ArrayList<>(35_000);
 
-                while (files.hasNext()) {
-                    LocatedFileStatus status = files.next();
-                    if (status.isFile() && status.getPath().getName().endsWith(".psv")) {
-                        foundFiles.add(status.getPath());
+                    while (files.hasNext()) {
+                        LocatedFileStatus status = files.next();
+                        if (status.isFile() && status.getPath().getName().endsWith(".psv")) {
+                            foundFiles.add(status.getPath());
+                        }
                     }
-                }
 
-                if (foundFiles.isEmpty()) {
-                    log.warn("No PSV input files found. configId={}, reportId={}, date={}, path={}", configId, reportId, date, baseDir);
-                    return future.complete(null);
-                }
+                    if (foundFiles.isEmpty()) {
+                        log.warn("No PSV input files found. configId={}, reportId={}, date={}, path={}", configId, reportId, date, baseDir);
+                        updateBatchStatus(batchId, Constants.FAILED, 0, 0, 0, "No PSV input files found");
+                        sendBatchEvent(batchId, Constants.FAILED, "No PSV input files found", eventTemplate);
+                        return future.complete(null);
+                    }
 
 //            String batchId = UUID.randomUUID().toString();
-                BATCH_TRACKER.put(batchId, new BatchStats(foundFiles.size(), eventTemplate));
-                updateBatchStatus(batchId, Constants.GENERATING, foundFiles.size(), 0, foundFiles.size(), "Batch started");
-                sendBatchEvent(batchId, Constants.GENERATING, "Batch started with " + foundFiles.size() + " files", eventTemplate);
+                    BATCH_TRACKER.put(batchId, new BatchStats(foundFiles.size(), eventTemplate));
+                    updateBatchStatus(batchId, Constants.STARTED, foundFiles.size(), 0, foundFiles.size(), "Batch started");
 
-                for (Path p : foundFiles) {
-                    jobQueueManager.submitFileJob(new FileJob(configId, p, batchId, date));
+                    for (Path p : foundFiles) {
+                        jobQueueManager.submitFileJob(new FileJob(configId, p, batchId, date));
 //                asciiService.processSingleFile(new FileJob(configId, p, batchId, date));
-                }
+                    }
 
-                log.info("ASCII batch started. batchId={}, configId={}, reportId={}, filesQueued={}", batchId, configId, reportId, foundFiles.size());
-                return future.complete(null);
-            } catch (IOException ex) {
-                log.error("ASCII batch initiation failed due to HDFS I/O. configId={}, date={}", configId, date, ex);
-                return future.complete(ex);
-            }
-        });
+                    log.info("ASCII batch started. batchId={}, configId={}, reportId={}, filesQueued={}", batchId, configId, reportId, foundFiles.size());
+                    return future.complete(null);
+                } catch (IOException | RuntimeException ex) {
+                    log.error("ASCII batch initiation failed. configId={}, date={}", configId, date, ex);
+                    updateBatchStatus(batchId, Constants.FAILED, 0, 0, 0, ex.getMessage());
+                    sendBatchEvent(batchId, Constants.FAILED, ex.getMessage(), eventTemplate);
+                    return future.complete(ex);
+                }
+            });
+        } catch (RejectedExecutionException ex) {
+            updateBatchStatus(batchId, Constants.FAILED, 0, 0, 0, "Submission queue is full");
+            sendBatchEvent(batchId, Constants.FAILED, "Submission queue is full", eventTemplate);
+            throw new BatchInitiationException("Submission queue is full", ex);
+        }
         future.exceptionally((e) -> {
             log.info("Execption Occurred!");
             return null;
@@ -170,10 +174,7 @@ public class AsciiGenerationService {
 //            Path outputFile = new Path(outputDir, branchCode + "." + config.getOutputFileName() + "." + header.reportDate + "." + config.getFileType());
 
             String fileType = config.getFileType();
-            StringBuilder fileNameBuilder = new StringBuilder()
-                    .append(branchCode).append(".")
-                    .append(config.getOutputFileName()).append(".")
-                    .append(header.reportDate);
+            StringBuilder fileNameBuilder = new StringBuilder().append(branchCode).append(".").append(config.getOutputFileName()).append(".").append(header.reportDate);
 
 
             if (fileType != null && !fileType.isEmpty()) {
@@ -333,8 +334,6 @@ public class AsciiGenerationService {
 //        }
 //        return (rounded.signum() < 0 ? "-" : "+") + String.format("%011d", rounded.abs().longValueExact());
 //    }
-
-
     private String formatPformAmount(BigDecimal amount) {
         // Handle null and round to whole number
         BigDecimal rounded = amount == null ? BigDecimal.ZERO : amount.setScale(0, RoundingMode.CEILING);
@@ -398,7 +397,7 @@ public class AsciiGenerationService {
         updateBatchStatus(job.getBatchId(), Constants.GENERATING, stats.totalFiles, stats.failedFiles.get(), remaining, "Batch processing");
         if (remaining == 0) {
             int failed = stats.failedFiles.get();
-            String status = failed == 0 ? Constants.SUCCESS : (failed < stats.totalFiles ? Constants.PARTIAL_SUCCESS : Constants.FAILED);
+            String status = failed == 0 ? Constants.COMPLETED : Constants.FAILED;
             long durationMs = System.currentTimeMillis() - stats.startTime;
             String remark = String.format("Batch completed. totalFiles=%d, failedFiles=%d, durationMs=%d", stats.totalFiles, failed, durationMs);
             if (reason != null && failed == stats.totalFiles) {
@@ -430,11 +429,15 @@ public class AsciiGenerationService {
         event.setProcessRunId(template.getProcessRunId());
         event.setStageId(template.getStageId());
         event.setRunId(template.getRunId());
-        event.setType(template.getType());
-        event.setId(template.getId());
-        event.setReportDate(template.getReportDate());
+        event.setReportType(template.getReportType());
+//        event.setPayload(template.getPayload());
+        event.setReportTriggered(Boolean.TRUE);
+        event.setStartTime(template.getStartTime());
+        if (!Constants.STARTED.equals(status)) {
+            event.setEndTime(Instant.now().toString());
+        }
         event.setStatus(status);
-        event.setRemark(remark + "; batchId=" + batchId);
+        event.setRemarks(remark + "; batchId=" + batchId);
         producer.sendResponse(event);
     }
 
@@ -553,7 +556,7 @@ public class AsciiGenerationService {
 
     private String normalizeDate(String d) {
         try {
-            return LocalDate.parse(d, DateTimeFormatter.ofPattern("yyyy-MM-dd")).format(DateTimeFormatter.ofPattern("yyyyMMdd"));
+            return LocalDate.parse(d, DateTimeFormatter.ofPattern("yyyy-MM-dd")).format(DateTimeFormatter.ofPattern("ddMMyyyy"));
         } catch (DateTimeParseException ex) {
             log.warn("Invalid report date found in ASCII header. value={}", d);
             return "";
@@ -561,8 +564,7 @@ public class AsciiGenerationService {
     }
 
     private enum AsciiOutputLayout {
-        STANDARD,
-        PFORM_BID_AMOUNT_SERIES;
+        STANDARD, PFORM_BID_AMOUNT_SERIES;
 
         private boolean matches(String configuredLayout) {
             return name().equalsIgnoreCase(configuredLayout == null ? STANDARD.name() : configuredLayout.trim());

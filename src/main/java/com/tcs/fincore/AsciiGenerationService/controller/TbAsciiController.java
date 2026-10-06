@@ -36,7 +36,7 @@ public class TbAsciiController {
             return ResponseEntity.badRequest().body(Map.of("error", "Mandatory fields missing (reportIds, branchCodes, balanceDate)"));
         }
 
-        SingletonMap<ReportStatus, String> submissionState = tbAsciiService.generateFiles(requestNew, "REST-Manual");
+        SingletonMap<ReportStatus, String> submissionState = tbAsciiService.generateFiles(requestNew, "REST");
         Map<String, Object> response = new HashMap<>();
         response.put("status", submissionState.getKey().name());
         response.put("message", submissionState.getValue());
